@@ -1,0 +1,43 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ucandrop
+Source: Distributed with the corresponding UCanDrop source archive.
+ Upstream sources are listed in THIRD_PARTY_NOTICES.md.
+
+Files: client/*
+Copyright: 2026 Brent Kearney
+ 2026 UCanDrop contributors
+License: MIT
+ See /usr/share/doc/ucandrop/licenses/omdrop-plugin-MIT.txt
+
+Files: receiver/* tools/* packaging/*
+Copyright: 2026 UCanDrop maintainers
+License: GPL-3+
+ See /usr/share/doc/ucandrop/licenses/owl-GPL-3.0.txt
+
+Files: radio/lib/omdrop-discoverable radio/lib/owl-profiles
+Copyright: 2026 Brent Kearney
+ 2026 UCanDrop maintainers
+License: GPL-3+
+ See /usr/share/doc/ucandrop/licenses/omdrop-owl-copyright
+
+Files: radio/lib/airdrop-send.py radio/lib/awdl-af-parse.py radio/lib/awdl-airdrop-adv.py radio/lib/awdl-mdns-respond.py radio/lib/awdl_debug.py radio/lib/awdl_identity.py radio/lib/ble-airdrop-adv.py radio/lib/send-to-peer
+Copyright: 2026 Brent Kearney and contributors
+License: GPL-2-only
+ See /usr/share/doc/ucandrop/licenses/omdrop-awdl-GPL-2.0.txt
+
+Files: vendor/owl/*
+Copyright: 2018 The Open Wireless Link Project
+ 2018 Milan Stute
+ OWL contributors
+License: GPL-3+
+ See /usr/share/doc/ucandrop/licenses/owl-GPL-3.0.txt
+
+Files: vendor/owl/radiotap/*
+Copyright: radiotap contributors
+License: ISC
+ See /usr/share/doc/ucandrop/licenses/radiotap-ISC.txt
+
+Files: vendor/owl/googletest/*
+Copyright: Google Inc. and contributors
+License: BSD-3-clause
+ See /usr/share/doc/ucandrop/licenses/googletest-BSD-3-Clause.txt

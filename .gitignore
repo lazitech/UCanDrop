@@ -1,0 +1,12 @@
+/build/
+/dist/
+__pycache__/
+*.py[cod]
+*.deb
+*.pcap
+*.pcapng
+*.key
+certificate.self-signed.pem
+key.self-signed.pem
+.venv/
+*.egg-info/

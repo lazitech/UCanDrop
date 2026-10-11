@@ -1,0 +1,46 @@
+Package: ucandrop
+Version: @VERSION@
+Section: net
+Priority: optional
+Maintainer: UCanDrop maintainers <ucandrop@packages.invalid>
+Architecture: @ARCH@
+Depends: bash,
+         bluez,
+         ca-certificates,
+         coreutils,
+         dbus,
+         desktop-file-utils,
+         ethtool,
+         iproute2,
+         iw,
+         keyutils,
+         libev4t64,
+         libnl-3-200,
+         libnl-genl-3-200,
+         libnl-route-3-200,
+         libnotify-bin,
+         libpcap0.8t64,
+         network-manager,
+         openssl,
+         pkexec,
+         polkitd,
+         python3 (>= 3.11),
+         python3-dbus,
+         python3-gi,
+         python3-ifaddr,
+         python3-libarchive-c,
+         python3-pil,
+         python3-zeroconf,
+         shared-mime-info,
+         systemd,
+         util-linux,
+         xdg-user-dirs,
+         xdg-utils
+Suggests: python3-pyqt6, wl-clipboard
+Description: AirDrop-compatible UCanDrop client and native radio backend
+ UCanDrop provides a user-facing command, an unprivileged AirDrop receiver,
+ and a source-built OWL radio backend for supported Ubuntu 26.04 systems.
+ Receiving is off after installation. The package installs no enabled service
+ and leaves setup and receive-window activation to the normal desktop user.
+ Hardware support is capability-probed; installation does not promise support
+ for every Wi-Fi adapter.

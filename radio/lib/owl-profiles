@@ -1,0 +1,21 @@
+# Shared-radio profiles for UCanDrop's OWL backend.
+#
+# A profile is a narrow driver workaround, not proof that the hardware can
+# inject, receive, or complete a transfer.  Every entry remains gated by the
+# runtime association, regulatory, monitor-capability, and OWL readiness checks;
+# `untested` also requires allow-untested=1 in /etc/ucandrop.
+#
+#   status     tested: this driver's strategy is reviewed for the release;
+#              runtime association/regulatory/monitor gates still apply
+#              and this does not claim every board or kernel works
+#              untested: no portable completion proof is claimed; explicit
+#              allow-untested=1 is required
+#   mode       shared: AWDL shares the currently associated AP channel
+#   mon_mac    station: monitor carries the station MAC; own: use a local
+#              monitor MAC and pass the station MAC to OWL with -m when needed
+#   reconnect  yes: reconnect the same managed device after monitor teardown
+#   mt76_pm    yes: guard mt76 runtime power management for the session
+#
+# driver   status    mode    mon_mac  reconnect  mt76_pm  notes
+mt7925e    tested    shared  station  yes        yes       Generic MT76 monitor/association workaround for the reviewed mt7925e driver strategy; runtime gates still apply.
+*          untested  shared  station  no         no        Generic shared-radio attempt; requires monitor injection and a supported associated AWDL channel.

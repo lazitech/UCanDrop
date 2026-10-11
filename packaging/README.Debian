@@ -1,0 +1,28 @@
+UCanDrop on Ubuntu
+==================
+
+This package installs the client, receiver completion modules, radio helpers,
+and a native OWL binary under /usr/lib/ucandrop. It has no maintainer scripts
+that enable or start a service, and receiving is disabled after installation.
+
+The runtime/radio interface is stable inside that tree: the client invokes
+/usr/lib/ucandrop/radio/omdrop-discoverable and
+/usr/lib/ucandrop/radio/send-to-peer, and both helpers find
+/usr/lib/ucandrop/radio/owl beside themselves. The package's polkit and
+NetworkManager fragments are installed from the matching files in packaging/;
+no legacy /usr/lib/omdrop path is used.
+
+As the normal desktop user, run:
+
+    ucandrop setup
+    ucandrop doctor --json
+    ucandrop on 1h
+
+The first command creates the per-user receiver configuration. The second
+checks the environment. The third opens a one-hour receive window.
+Use `ucandrop off` to close it early. Installing this package requires no
+source compilation and no invocation of tools/install.sh.
+
+The package targets Ubuntu 26.04 with NetworkManager and a supported Wi-Fi
+adapter. The radio backend reports unsupported or unverified hardware instead
+of claiming that every adapter can provide AirDrop service.

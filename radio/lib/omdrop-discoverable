@@ -1,0 +1,925 @@
+#!/usr/bin/env bash
+# UCanDrop's OWL radio helper.
+#
+# The helper owns one bounded shared-radio session.  It chooses a currently
+# associated managed interface, verifies the physical channel and monitor
+# capability before changing the radio, and records enough ownership state to
+# clean up only the interfaces and processes created by this session.
+set -uo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+LIB=$(dirname "$SELF")
+RUN=${UCANDROP_RUN:-/run/ucandrop-owl}
+CONF=${UCANDROP_CONF:-/etc/ucandrop}
+SYSFS_ROOT=${UCANDROP_SYSFS:-/sys}
+DEBUGFS_ROOT=${UCANDROP_DEBUGFS:-/sys/kernel/debug}
+OWL_LOG=$RUN/owl.log
+IF=awdl0                         # OWL/backend contract; never user identity.
+OWL_BIN=$LIB/owl
+PROFILES=$LIB/owl-profiles
+MON=
+REG_REASON=
+STATION_REASON=
+ADV_FLAGS=137
+ADV_INTERVAL=3
+VERSION=1.1.0
+CONTRACT=0.8.1
+
+# These are AWDL's supported shared-radio AP frequencies.  They are protocol
+# limits, not a default router or a local machine's network configuration.
+AWDL_FREQ_24=2437
+AWDL_FREQ_44=5220
+AWDL_FREQ_149=5745
+
+log() {
+  { mkdir -p "$RUN" && printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*" >> "$RUN/log"; } 2>/dev/null || true
+}
+die() {
+  log "error: $1"
+  echo "omdrop-discoverable: $1" >&2
+  exit "${2:-2}"
+}
+knob() { head -1 "$CONF/$1" 2>/dev/null | tr -d '[:space:]' || true; }
+need_root() { [ "$(id -u)" = 0 ] || die 'must run as root through the named polkit action' 2; }
+
+# Keep every external hardware query bounded.  A missing timeout is treated as
+# a dependency failure by the probe, rather than allowing a privileged helper
+# to hang indefinitely.
+bounded() {
+  command -v timeout >/dev/null 2>&1 || return 127
+  timeout -k 1 5 "$@"
+}
+
+valid_iface_name() { [[ "${1:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]; }
+sys_iface() { printf '%s/class/net/%s\n' "$SYSFS_ROOT" "$1"; }
+iface_exists() { [ -e "$(sys_iface "$1")" ]; }
+
+alive() {  # PID [command fragment]
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && [ -r "/proc/$1/cmdline" ] \
+    && { [ -z "${2:-}" ] || tr '\0' ' ' < "/proc/$1/cmdline" | grep -qF -- "$2"; }
+}
+pid_of() { cat "$RUN/$1.pid" 2>/dev/null; }
+process_ticks() {
+  [ -r "/proc/$1/stat" ] || return 1
+  # After the PID and parenthesized comm field are removed, awk field 20 is
+  # procfs field 22 (starttime).  This value changes when a PID is reused.
+  sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+process_uid() {
+  [ -r "/proc/$1/status" ] || return 1
+  awk '/^Uid:[[:space:]]/ {print $2; exit}' "/proc/$1/status"
+}
+process_ppid() {
+  [ -r "/proc/$1/stat" ] || return 1
+  # After the PID and parenthesized comm field are removed, awk field 2 is
+  # procfs field 4 (the parent PID).
+  sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $2}'
+}
+process_exe() {
+  local exe
+  exe=$(readlink -f "/proc/$1/exe" 2>/dev/null) || return 1
+  [ -n "$exe" ] && [[ "$exe" != /proc/* ]] || return 1
+  printf '%s\n' "$exe"
+}
+atomic_state() {  # name value
+  local tmp="$RUN/.$1.$$"
+  mkdir -p "$RUN" 2>/dev/null || return 1
+  printf '%s\n' "$2" > "$tmp" && chmod 644 "$tmp" && mv -f -- "$tmp" "$RUN/$1"
+}
+atomic_blob() {  # name source-file; used for exact /proc/$pid/cmdline snapshots
+  local tmp="$RUN/.$1.$$"
+  mkdir -p "$RUN" 2>/dev/null || return 1
+  cp -- "$2" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  # The argv contains only the fixed OWL/supervisor invocation and is needed
+  # by an unprivileged status caller to prove that a PID is still ours.
+  chmod 644 "$tmp" && mv -f -- "$tmp" "$RUN/$1"
+}
+process_snapshot() {  # PID destination-file
+  local pid=${1:-} destination=${2:-}
+  [[ "$pid" =~ ^[0-9]+$ && -n "$destination" ]] || return 1
+  # cp preserves procfs's read-only mode on the first snapshot.  Remove the
+  # private temporary before each retry so a wrapper snapshot cannot make the
+  # next exact-argv check fail with EACCES after the exec transition.
+  rm -f -- "$destination" 2>/dev/null || return 1
+  cp -- "/proc/$pid/cmdline" "$destination" 2>/dev/null && [ -s "$destination" ]
+}
+write_argv_snapshot() {  # DESTINATION ARG...
+  local destination=${1:-} arg
+  shift || true
+  [ -n "$destination" ] || return 1
+  : > "$destination" || return 1
+  for arg in "$@"; do
+    printf '%s\0' "$arg" >> "$destination" || return 1
+  done
+  [ -s "$destination" ]
+}
+process_identity() {  # PID PATTERN STARTTIME UID ARGV-FILE [PARENT-PID] [EXE] [EXE-CHECK]
+  local pid=${1:-} pattern=${2:-} expected_ticks=${3:-}
+  local expected_uid=${4:-} argv_file=${5:-} expected_parent=${6:-}
+  local expected_exe=${7:-} exe_check=${8:-required} actual_exe
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [ -r "/proc/$pid/stat" ] && [ -r "/proc/$pid/status" ] && [ -r "/proc/$pid/cmdline" ] || return 1
+  [ -z "$pattern" ] || alive "$pid" "$pattern" || return 1
+  [ -z "$expected_ticks" ] || [ "$(process_ticks "$pid")" = "$expected_ticks" ] || return 1
+  [ -z "$expected_uid" ] || [ "$(process_uid "$pid")" = "$expected_uid" ] || return 1
+  [ -z "$expected_parent" ] || [ "$(process_ppid "$pid")" = "$expected_parent" ] || return 1
+  if [ -n "$expected_exe" ]; then
+    actual_exe=$(process_exe "$pid" 2>/dev/null || true)
+    case "$exe_check" in
+      readonly)
+        # A status caller may not be able to read /proc/$pid/exe for a
+        # root-owned child. Exact argv, starttime, UID, and liveness remain
+        # required; if exe is readable, reject a mismatch rather than hiding it.
+        [ -z "$actual_exe" ] || [ "$actual_exe" = "$expected_exe" ] || return 1
+        ;;
+      *)
+        # Teardown and recording always require an independently readable,
+        # resolved executable. Never let an inaccessible exe downgrade a kill
+        # into a command-fragment check.
+        [ -n "$actual_exe" ] && [ "$actual_exe" = "$expected_exe" ] || return 1
+        ;;
+    esac
+  fi
+  [ -z "$argv_file" ] || [ -r "$argv_file" ] || return 1
+  [ -z "$argv_file" ] || cmp -s "$argv_file" "/proc/$pid/cmdline" || return 1
+  return 0
+}
+clear_process_state() { rm -f "$RUN/$1.pid" "$RUN/$1.start" "$RUN/$1.uid" "$RUN/$1.argv" "$RUN/$1.exe"; }
+record_process() {  # NAME PID RESOLVED-EXE EXPECTED-ARGV...
+  local name=${1:-} pid=${2:-} expected_exe=${3:-}
+  local ticks uid owner exe tmp expected_tmp i
+  local -a expected_argv
+  [[ "$name" =~ ^[A-Za-z0-9_.-]+$ && "$pid" =~ ^[0-9]+$ \
+      && "$expected_exe" = /* && "$#" -ge 4 ]] || return 1
+  shift 3
+  expected_argv=("$@")
+  clear_process_state "$name"
+  owner=$(cat "$RUN/owner-uid" 2>/dev/null || true)
+  # Keep the /proc snapshot separate from atomic_blob's destination temp.
+  tmp="$RUN/.snapshot-$name.argv.$$"
+  expected_tmp="$RUN/.expected-$name.argv.$$"
+  write_argv_snapshot "$expected_tmp" "${expected_argv[@]}" || {
+    rm -f "$expected_tmp"
+    return 1
+  }
+  for i in $(seq 1 25); do
+    # The shim itself has the target path in its argv while it is waiting to
+    # exec.  Compare the complete NUL-separated argv and resolved executable;
+    # a substring is deliberately insufficient here.
+    if process_snapshot "$pid" "$tmp" && cmp -s "$expected_tmp" "$tmp"; then
+      ticks=$(process_ticks "$pid" 2>/dev/null || true)
+      uid=$(process_uid "$pid" 2>/dev/null || true)
+      exe=$(process_exe "$pid" 2>/dev/null || true)
+      if [ "$exe" = "$expected_exe" ] && [ -n "$ticks" ] && [ -n "$uid" ] \
+          && { [ -z "$owner" ] || [ "$uid" = "$owner" ]; } \
+          && process_snapshot "$pid" "$tmp"; then
+        # Recheck the identity after taking the argv snapshot.  A short-lived
+        # process must never leave state for a PID that has already changed.
+        if cmp -s "$expected_tmp" "$tmp" \
+            && process_identity "$pid" '' "$ticks" "$uid" "$tmp" '' "$expected_exe" required; then
+          if atomic_state "$name.pid" "$pid" \
+            && atomic_state "$name.start" "$ticks" \
+            && atomic_state "$name.uid" "$uid" \
+            && atomic_state "$name.exe" "$exe" \
+            && atomic_blob "$name.argv" "$tmp"; then
+            rm -f "$tmp" "$expected_tmp"
+            return 0
+          fi
+          clear_process_state "$name"
+        fi
+      fi
+    fi
+    sleep 0.02
+  done
+  rm -f "$tmp" "$expected_tmp"
+  return 1
+}
+owned_pid() {  # NAME [command fragment] [required|readonly]; prints PID only after checks
+  local name=${1:-} pattern=${2:-} verify_exe=${3:-required}
+  local pid ticks uid owner exe
+  [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  pid=$(pid_of "$name")
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [ "$pid" != "$$" ] && [ "$pid" != "${PPID:-}" ] || return 1
+  ticks=$(cat "$RUN/$name.start" 2>/dev/null || true)
+  uid=$(cat "$RUN/$name.uid" 2>/dev/null || true)
+  exe=$(cat "$RUN/$name.exe" 2>/dev/null || true)
+  owner=$(cat "$RUN/owner-uid" 2>/dev/null || true)
+  [ -n "$ticks" ] && [ -n "$uid" ] && [ -n "$exe" ] && [ -n "$owner" ] && [ "$uid" = "$owner" ] || return 1
+  process_identity "$pid" "$pattern" "$ticks" "$uid" "$RUN/$name.argv" '' "$exe" "$verify_exe" || return 1
+  printf '%s\n' "$pid"
+}
+
+# ---------------------------------------------------------------- interface selection
+
+iface_is_managed() {
+  local info
+  valid_iface_name "$1" || return 1
+  [ -e "$(sys_iface "$1")/phy80211" ] || return 1
+  info=$(bounded iw dev "$1" info 2>/dev/null) || return 1
+  grep -Eq '^[[:space:]]*type[[:space:]]+managed([[:space:]]|$)' <<< "$info"
+}
+iface_is_connected() {
+  local link
+  link=$(bounded iw dev "$1" link 2>/dev/null) || return 1
+  grep -Eq '^[[:space:]]*Connected to[[:space:]]+[0-9a-fA-F:]{17}([[:space:]]|$)' <<< "$link"
+}
+
+# A configured interface must be a real managed wireless interface.  Without
+# one, connected managed interfaces win over disconnected ones, and ties are
+# lexical so two radios do not change selection across shell glob ordering.
+station_iface() {
+  local forced d name info
+  STATION_REASON=
+  forced=${REQUEST_IFACE:-}
+  [ -n "$forced" ] || forced=${UCANDROP_INFRA_IFACE:-}
+  [ -n "$forced" ] || forced=$(knob infra-iface)
+  if [ -n "$forced" ]; then
+    if ! valid_iface_name "$forced" || ! iface_is_managed "$forced"; then
+      STATION_REASON='the configured Wi-Fi interface is unavailable or is not a managed wireless interface'
+      return 1
+    fi
+    printf '%s\n' "$forced"
+    return 0
+  fi
+
+  local -a names=()
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    name=$(basename "$(dirname "$d")")
+    valid_iface_name "$name" && names+=("$name")
+  done < <(printf '%s\n' "$SYSFS_ROOT"/class/net/*/phy80211 2>/dev/null | sort -u)
+  [ "${#names[@]}" -gt 0 ] || {
+    STATION_REASON='no managed wireless interface is available'
+    return 1
+  }
+  for name in "${names[@]}"; do
+    iface_is_managed "$name" && iface_is_connected "$name" && {
+      printf '%s\n' "$name"
+      return 0
+    }
+  done
+  for name in "${names[@]}"; do
+    iface_is_managed "$name" && {
+      printf '%s\n' "$name"
+      return 0
+    }
+  done
+  STATION_REASON='no managed wireless interface is available'
+  return 1
+}
+
+driver_of() {
+  local link
+  link=$(readlink -f "$(sys_iface "$1")/device/driver" 2>/dev/null) || return 1
+  basename "$link"
+}
+phy_of() {
+  local link
+  link=$(readlink -f "$(sys_iface "$1")/phy80211" 2>/dev/null) || return 1
+  basename "$link"
+}
+station_mac() {
+  local mac
+  mac=$(cat "$(sys_iface "$1")/address" 2>/dev/null) || return 1
+  [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || return 1
+  printf '%s\n' "${mac,,}"
+}
+
+# Read only the association state.  IPv4 routes, gateway reachability, and
+# other network tests do not participate in the link-local AWDL data path.
+station_link() {  # IFACE -> BSSID FREQUENCY LOCAL_MAC
+  local data bssid freq mac
+  valid_iface_name "$1" || return 1
+  data=$(bounded iw dev "$1" link 2>/dev/null) || return 1
+  bssid=$(awk '/^[[:space:]]*Connected to / {print tolower($3); exit}' <<< "$data")
+  freq=$(awk '/^[[:space:]]*freq:/ {print int($2); exit}' <<< "$data")
+  mac=$(station_mac "$1") || return 1
+  [[ "$bssid" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ && "$freq" =~ ^[0-9]+$ ]] || return 1
+  printf '%s %s %s\n' "$bssid" "$freq" "$mac"
+}
+
+# ---------------------------------------------------------------- capability/regulatory gates
+
+channel_for_frequency() {
+  case "${1:-}" in
+    "$AWDL_FREQ_24")  printf '6\n' ;;
+    "$AWDL_FREQ_44")  printf '44\n' ;;
+    "$AWDL_FREQ_149") printf '149\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+frequency_legal() {  # FREQUENCY PHY
+  local freq=${1:-} phy=${2:-} info line reg regline
+  REG_REASON=
+  [[ "$freq" =~ ^[0-9]+$ && "$phy" =~ ^[A-Za-z0-9_.:-]+$ ]] || {
+    REG_REASON='the associated frequency or physical radio is invalid'
+    return 1
+  }
+  info=$(bounded iw phy "$phy" info 2>/dev/null) || {
+    REG_REASON='regulatory radio capabilities could not be read'
+    return 1
+  }
+  # iw may print integer MHz or zero decimal fractions (e.g. 5745.0 MHz).
+  # Match the exact frequency field; never a substring or a nearby channel.
+  line=$(awk -v f="$freq" '
+      $1 == "*" && $3 == "MHz" && $2 ~ /^[0-9]+([.]0+)?$/ && $2 + 0 == f {
+        print; exit
+      }
+    ' <<< "$info")
+  [ -n "$line" ] || {
+    REG_REASON='the associated frequency is not advertised by this physical radio'
+    return 1
+  }
+  if [[ "$line" =~ [Dd]isabled|[Nn][Oo][-[:space:]]?[Ii][Rr]|[Rr]adar[[:space:]]+[Dd]etection ]]; then
+    REG_REASON='the associated frequency is disabled or marked no-IR by the regulatory data'
+    return 1
+  fi
+  # Some iw versions repeat the regulatory flag in `iw reg get` rather than
+  # the PHY frequency table.  Reject an exact-frequency no-IR/disabled record
+  # when it is present, while accepting normal range-based regulatory output.
+  reg=$(bounded iw reg get 2>/dev/null) || reg=
+  while IFS= read -r regline; do
+    [[ "$regline" == *"$freq MHz"* ]] || continue
+    if [[ "$regline" =~ [Dd]isabled|[Nn][Oo][-[:space:]]?[Ii][Rr]|[Rr]adar[[:space:]]+[Dd]etection ]]; then
+      REG_REASON='the associated frequency is marked no-IR or otherwise unusable by the regulatory domain'
+      return 1
+    fi
+  done <<< "$reg"
+  # Most iw versions expose regulatory rules as ranges followed by an
+  # indented flag line.  Reject a no-IR/DFS rule that covers the associated
+  # frequency, while leaving ordinary legal range records alone.
+  if awk -v f="$freq" '
+      /^[[:space:]]*\([0-9]+[[:space:]]*-[[:space:]]*[0-9]+/ {
+        s=$0; sub(/^[^(]*\(/, "", s); gsub(/[()]/, "", s)
+        split(s, a, /[[:space:]-]+/)
+        low=a[1]; high=a[2]
+        inrange=(f >= low && f <= high)
+        if (inrange && tolower($0) ~ /no[ -]?ir|disabled|radar[[:space:]]+detection/) { print; exit }
+        next
+      }
+      inrange && tolower($0) ~ /no[ -]?ir|disabled|radar[[:space:]]+detection/ { print; exit }
+    ' <<< "$reg" | grep -q .; then
+    REG_REASON='the associated frequency is covered by a no-IR or DFS regulatory rule'
+    return 1
+  fi
+  return 0
+}
+
+monitor_capable() {  # PHY
+  local info
+  info=$(bounded iw phy "$1" info 2>/dev/null) || return 1
+  grep -Eq '^[[:space:]]*\*[[:space:]]+monitor([[:space:]]|$)' <<< "$info"
+}
+
+# ---------------------------------------------------------------- profile and MT76 power management
+
+load_profile() {  # DRIVER; sets PROF_* globals
+  local line table
+  PROF_STATUS= PROF_MODE= PROF_MONMAC= PROF_RECONNECT= PROF_PM=
+  for table in "$CONF/owl-profiles" "$PROFILES"; do
+    [ -r "$table" ] || continue
+    line=$(awk -v d="$1" '!/^#/ && NF >= 6 && $1 == d {print; exit}' "$table")
+    [ -n "$line" ] || line=$(awk '!/^#/ && NF >= 6 && $1 == "*" {print; exit}' "$table")
+    [ -n "$line" ] || continue
+    read -r _ PROF_STATUS PROF_MODE PROF_MONMAC PROF_RECONNECT PROF_PM _ <<< "$line"
+    case "$PROF_STATUS:$PROF_MODE:$PROF_MONMAC:$PROF_RECONNECT:$PROF_PM" in
+      tested:shared:station:*:*|tested:shared:own:*:*|untested:shared:station:*:*|untested:shared:own:*:*)
+        case "$PROF_RECONNECT:$PROF_PM" in
+          yes:yes|yes:no|no:yes|no:no) return 0 ;;
+        esac
+        ;;
+    esac
+  done
+  return 1
+}
+untested_hint() {
+  echo 'This radio profile is unverified on this computer. To try it, set allow-untested=1 in the UCanDrop radio configuration.'
+}
+profile_allowed() { [ "$PROF_STATUS" = tested ] || [ "$(knob allow-untested)" = 1 ]; }
+
+mt76_dir() {
+  local phy
+  phy=$(phy_of "$1") || return 1
+  printf '%s/ieee80211/%s/mt76\n' "$DEBUGFS_ROOT" "$phy"
+}
+mt76_pm_prepare() {  # IFACE; failure is safe and leaves PM unchanged
+  [ "$PROF_PM" = yes ] || return 0
+  local directory runtime deep
+  directory=$(mt76_dir "$1") || return 0
+  if [ ! -d "$DEBUGFS_ROOT" ] || ! command -v mountpoint >/dev/null 2>&1; then
+    log 'mt76 power management unavailable; leaving driver defaults unchanged'
+    return 0
+  fi
+  if ! mountpoint -q "$DEBUGFS_ROOT"; then
+    command -v mount >/dev/null 2>&1 || return 0
+    mount -t debugfs none "$DEBUGFS_ROOT" 2>/dev/null || {
+      log 'could not mount debugfs; leaving mt76 power management unchanged'
+      return 0
+    }
+  fi
+  [ -r "$directory/runtime-pm" ] && [ -r "$directory/deep-sleep" \
+    ] && [ -w "$directory/runtime-pm" ] && [ -w "$directory/deep-sleep" ] || {
+    log 'mt76 PM controls are incomplete; leaving driver defaults unchanged'
+    return 0
+  }
+  runtime=$(cat "$directory/runtime-pm" 2>/dev/null | tr -d '[:space:]')
+  deep=$(cat "$directory/deep-sleep" 2>/dev/null | tr -d '[:space:]')
+  [[ "$runtime" =~ ^[01]$ && "$deep" =~ ^[01]$ ]] || {
+    log 'mt76 PM controls contain unexpected values; leaving driver defaults unchanged'
+    return 0
+  }
+  atomic_state pm "$runtime $deep" || return 0
+  atomic_state pm-station "$1" || { rm -f "$RUN/pm"; return 0; }
+  if ! printf '0\n' > "$directory/runtime-pm" || ! printf '0\n' > "$directory/deep-sleep" \
+      || [ "$(cat "$directory/runtime-pm" 2>/dev/null)" != 0 ] \
+      || [ "$(cat "$directory/deep-sleep" 2>/dev/null)" != 0 ]; then
+    printf '%s\n' "$runtime" > "$directory/runtime-pm" 2>/dev/null || true
+    printf '%s\n' "$deep" > "$directory/deep-sleep" 2>/dev/null || true
+    rm -f "$RUN/pm" "$RUN/pm-station"
+    log 'mt76 PM could not be changed atomically; defaults restored where possible'
+  fi
+}
+mt76_pm_restore() {
+  local sta pm directory runtime deep
+  sta=$(cat "$RUN/pm-station" 2>/dev/null)
+  pm=$(cat "$RUN/pm" 2>/dev/null)
+  if [ -n "$sta" ] && [[ "$pm" =~ ^[01][[:space:]][01]$ ]]; then
+    directory=$(mt76_dir "$sta" 2>/dev/null) || directory=
+    runtime=$(cat "$directory/runtime-pm" 2>/dev/null | tr -d '[:space:]')
+    deep=$(cat "$directory/deep-sleep" 2>/dev/null | tr -d '[:space:]')
+    # Do not overwrite a value changed by the user, suspend, or a driver
+    # reload after this session took its snapshot.
+    if [ "$runtime" = 0 ] && [ "$deep" = 0 ] \
+        && [ -w "$directory/runtime-pm" ] && [ -w "$directory/deep-sleep" ]; then
+      printf '%s\n' "${pm%% *}" > "$directory/runtime-pm" 2>/dev/null || true
+      printf '%s\n' "${pm##* }" > "$directory/deep-sleep" 2>/dev/null || true
+    else
+      log 'mt76 PM values changed outside this session; leaving them untouched'
+    fi
+  fi
+  rm -f "$RUN/pm" "$RUN/pm-station"
+}
+
+# ---------------------------------------------------------------- owned monitor and process lifecycle
+
+monitor_exists() {
+  [ -n "${MON:-}" ] && bounded iw dev "$MON" info >/dev/null 2>&1
+}
+new_monitor_name() {
+  local i value candidate
+  for i in $(seq 1 50); do
+    value=$(( (RANDOM + $$ + i) & 1048575 ))
+    candidate="ucandrop-$(printf '%05x' "$value")"
+    MON=$candidate
+    monitor_exists || { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+monitor_identity_matches() {  # STATION
+  local sta=${1:-} expected info actual_phy actual_addr marker_addr
+  [ -e "$RUN/monitor-created" ] || return 1
+  [ "$(cat "$RUN/monitor-station" 2>/dev/null)" = "$sta" ] || return 1
+  expected=$(phy_of "$sta") || return 1
+  [ "$(cat "$RUN/monitor-phy" 2>/dev/null)" = "$expected" ] || return 1
+  [ -n "${MON:-}" ] || MON=$(cat "$RUN/monitor-name" 2>/dev/null)
+  valid_iface_name "$MON" || return 1
+  info=$(bounded iw dev "$MON" info 2>/dev/null) || return 1
+  grep -Eq '^[[:space:]]*type[[:space:]]+monitor([[:space:]]|$)' <<< "$info" || return 1
+  actual_phy=$(awk '/^[[:space:]]*wiphy[[:space:]]+[0-9]+/ {print "phy" $2; exit}' <<< "$info")
+  [ "$actual_phy" = "$expected" ] || return 1
+  marker_addr=$(cat "$RUN/monitor-address" 2>/dev/null)
+  [ -z "$marker_addr" ] || {
+    actual_addr=$(awk '/^[[:space:]]*addr[[:space:]]+[0-9a-fA-F:]{17}/ {print tolower($2); exit}' <<< "$info")
+    [ "${actual_addr,,}" = "${marker_addr,,}" ]
+  }
+}
+monitor_cleanup() {  # STATION; only delete a monitor with matching ownership proof
+  local sta=${1:-} oldmon rc=0
+  oldmon=${MON:-}
+  [ -n "$oldmon" ] || oldmon=$(cat "$RUN/monitor-name" 2>/dev/null)
+  MON=$oldmon
+  if [ -e "$RUN/monitor-created" ] && monitor_identity_matches "$sta"; then
+    bounded ip link set "$MON" down 2>/dev/null || rc=1
+    bounded iw dev "$MON" del 2>/dev/null || rc=1
+    if monitor_exists; then rc=1; else rm -f "$RUN/monitor-created" "$RUN/monitor-station" "$RUN/monitor-phy" "$RUN/monitor-address" "$RUN/monitor-name"; fi
+  elif monitor_exists; then
+    # A pre-existing or replaced monitor is foreign.  Never delete mon0 or a
+    # product monitor whose ownership marker no longer matches.
+    log 'refusing to delete a monitor whose ownership identity changed'
+    rc=1
+  else
+    rm -f "$RUN/monitor-created" "$RUN/monitor-station" "$RUN/monitor-phy" "$RUN/monitor-address" "$RUN/monitor-name"
+  fi
+  return "$rc"
+}
+
+# Reset signal dispositions before exec, then track only the resulting PID.
+# This prevents a shell's inherited ignored TERM/HUP from defeating bounded
+# cleanup.  The process tree is terminated through /proc children, never via a
+# broad name-based process kill that could kill another user's OWL.
+spawn_reset() {
+  # fd 9 is the session lock held by the foreground helper.  Close it before
+  # exec so a long-lived child cannot keep a later stop waiting on that lock.
+  # The caller always backgrounds this function.  `exec` is essential: it
+  # makes the shell's `$!` the same PID as the eventual OWL/supervisor child,
+  # rather than a wrapper whose command line could contain a false substring.
+  exec /usr/bin/python3 "$LIB/ucandrop-exec-reset.py" "$@"
+}
+terminate_tree() {  # PID PATTERN STARTTIME UID ARGV-FILE [PARENT-PID] [EXE]
+  local pid=${1:-} pattern=${2:-} expected_ticks=${3:-} expected_uid=${4:-}
+  local argv_file=${5:-} expected_parent=${6:-} expected_exe=${7:-}
+  local child children child_ticks child_uid child_exe child_argv
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  # All callers must supply a complete identity.  A PID or command fragment
+  # alone is unsafe after a crash or PID reuse.
+  [ -n "$expected_ticks" ] && [ -n "$expected_uid" ] && [ -n "$expected_exe" ] && [ -r "$argv_file" ] || return 0
+  process_identity "$pid" "$pattern" "$expected_ticks" "$expected_uid" "$argv_file" "$expected_parent" "$expected_exe" required || return 0
+  children=$(cat "/proc/$pid/task/$pid/children" 2>/dev/null || true)
+  for child in $children; do
+    [[ "$child" =~ ^[0-9]+$ ]] || continue
+    [ "$(process_ppid "$child" 2>/dev/null || true)" = "$pid" ] || continue
+    child_ticks=$(process_ticks "$child" 2>/dev/null || true)
+    child_uid=$(process_uid "$child" 2>/dev/null || true)
+    child_exe=$(process_exe "$child" 2>/dev/null || true)
+    [ -n "$child_ticks" ] && [ "$child_uid" = "$expected_uid" ] && [ -n "$child_exe" ] || continue
+    child_argv="$RUN/.tree-${pid}-${child}-$$"
+    if process_snapshot "$child" "$child_argv" \
+        && process_identity "$child" '' "$child_ticks" "$expected_uid" "$child_argv" "$pid" "$child_exe" required; then
+      terminate_tree "$child" '' "$child_ticks" "$expected_uid" "$child_argv" "$pid" "$child_exe"
+    fi
+    rm -f "$child_argv"
+  done
+  process_identity "$pid" "$pattern" "$expected_ticks" "$expected_uid" "$argv_file" "$expected_parent" "$expected_exe" required || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  local i
+  for i in $(seq 1 20); do
+    process_identity "$pid" "$pattern" "$expected_ticks" "$expected_uid" "$argv_file" "$expected_parent" "$expected_exe" required || return 0
+    sleep 0.1
+  done
+  process_identity "$pid" "$pattern" "$expected_ticks" "$expected_uid" "$argv_file" "$expected_parent" "$expected_exe" required \
+    && kill -KILL "$pid" 2>/dev/null || true
+}
+
+terminate_named_process() {  # NAME [command fragment]
+  local name=${1:-} pattern=${2:-} pid ticks uid exe
+  pid=$(owned_pid "$name" "$pattern" 2>/dev/null || true)
+  [ -n "$pid" ] || return 0
+  ticks=$(cat "$RUN/$name.start" 2>/dev/null || true)
+  uid=$(cat "$RUN/$name.uid" 2>/dev/null || true)
+  exe=$(cat "$RUN/$name.exe" 2>/dev/null || true)
+  terminate_tree "$pid" "$pattern" "$ticks" "$uid" "$RUN/$name.argv" '' "$exe"
+}
+
+terminate_launch_process() {  # PID [command fragment]; used before state is durable
+  local pid=${1:-} pattern=${2:-} ticks uid exe owner argv
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  alive "$pid" "$pattern" || return 0
+  owner=$(cat "$RUN/owner-uid" 2>/dev/null || true)
+  ticks=$(process_ticks "$pid" 2>/dev/null || true)
+  uid=$(process_uid "$pid" 2>/dev/null || true)
+  exe=$(process_exe "$pid" 2>/dev/null || true)
+  [ -n "$owner" ] && [ "$uid" = "$owner" ] && [ -n "$ticks" ] && [ -n "$exe" ] || return 0
+  argv="$RUN/.launch-${pid}-$$"
+  if process_snapshot "$pid" "$argv" \
+      && process_identity "$pid" "$pattern" "$ticks" "$uid" "$argv" '' "$exe" required; then
+    terminate_tree "$pid" "$pattern" "$ticks" "$uid" "$argv" '' "$exe"
+  fi
+  rm -f "$argv"
+}
+
+stop_owned_processes() {
+  # Stop the supervisor first so it cannot create another announcement while
+  # the OWL child is being reaped.  Each call revalidates all identity state.
+  terminate_named_process supervisor '__supervise'
+  terminate_named_process announce 'awdl-airdrop-adv.py'
+  terminate_named_process owl "$OWL_BIN"
+  clear_process_state supervisor
+  clear_process_state announce
+  clear_process_state owl
+}
+
+# ---------------------------------------------------------------- status/probe
+
+usable_awdl_ipv6() {
+  local addr
+  addr=$(bounded ip -6 addr show dev "$IF" scope link 2>/dev/null) || return 1
+  grep -q inet6 <<< "$addr" && ! grep -qE 'tentative|dadfailed' <<< "$addr"
+}
+visible() {
+  local sup owl sta
+  # Status is intentionally usable from an ordinary session.  Some Ubuntu
+  # procfs configurations hide /proc/<root-pid>/exe, so retain the exact
+  # argv/starttime/UID liveness proof without requiring that one read-only
+  # attribute.  Stop/teardown paths keep the required executable check.
+  sup=$(owned_pid supervisor '__supervise' readonly 2>/dev/null || true)
+  owl=$(owned_pid owl "$OWL_BIN" readonly 2>/dev/null || true)
+  sta=$(cat "$RUN/station" 2>/dev/null)
+  [ -n "$sup" ] && [ -n "$owl" ] \
+    && monitor_identity_matches "$sta" && usable_awdl_ipv6 \
+    && [ "$(cat "$RUN/state" 2>/dev/null)" = ready ]
+}
+cmd_status() {
+  local vis=false remaining=null reason until now rx=false
+  reason=$(cat "$RUN/reason" 2>/dev/null)
+  until=$(cat "$RUN/until" 2>/dev/null)
+  now=$(date +%s)
+  if visible; then
+    vis=true
+    [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt 0 ] && remaining=$(( until > now ? until - now : 0 ))
+    grep -q 'add peer' "$OWL_LOG" 2>/dev/null && rx=true
+  fi
+  if [ "${1:-}" = --json ]; then
+    VIS=$vis REMAINING=$remaining REASON=$reason RX=$rx V=$VERSION C=$CONTRACT python3 -c '
+import json, os
+x=os.environ
+print(json.dumps({"visible": x["VIS"] == "true",
+                  "remaining": None if x["REMAINING"] == "null" else int(x["REMAINING"]),
+                  "reason": x["REASON"], "rx_proven": x["RX"] == "true",
+                  "peer_op": "", "backend": "owl", "version": x["V"],
+                  "contract": x["C"]}, separators=(",", ":")))'
+  else
+    printf 'visible=%s remaining=%s reason=%s rx_proven=%s\n' "$vis" "$remaining" "$reason" "$rx"
+  fi
+}
+cmd_peers() {
+  [ -r "$OWL_LOG" ] || return 0
+  grep -oE '(add|remove) peer [0-9a-f:]+' "$OWL_LOG" | awk '
+    { n = split($3, o, ":"); mac = ""
+      for (i = 1; i <= n; i++) mac = mac (i > 1 ? ":" : "") sprintf("%02s", o[i])
+      gsub(/ /, "0", mac)
+      if ($1 == "add") seen[mac] = 1; else delete seen[mac] }
+    END { for (m in seen) print m " rssi=?" }'
+}
+
+cmd_probe() {
+  local sta= drv= link= freq= phy= hw=true missing=() channel
+  sta=$(station_iface 2>/dev/null || true)
+  if [ -z "$sta" ]; then
+    hw=false
+    missing+=("hardware|${STATION_REASON:-no managed wireless interface is available}")
+  else
+    drv=$(driver_of "$sta" 2>/dev/null || true)
+    if ! load_profile "$drv"; then
+      hw=false
+      missing+=("backend|The installed radio profile table has no usable entry.")
+    elif ! profile_allowed; then
+      hw=false
+      missing+=("hardware|$(untested_hint)")
+    else
+      [ -x "$OWL_BIN" ] || missing+=("backend|The OWL radio executable is not installed.")
+      [ "$PROF_MODE" = shared ] || missing+=("backend|This radio profile does not support shared mode.")
+      link=$(station_link "$sta" 2>/dev/null || true)
+      if [ -z "$link" ]; then
+        missing+=("radio|Wi-Fi is not associated. Shared-channel AirDrop needs an associated managed interface.")
+      else
+        read -r _ freq _ <<< "$link"
+        channel=$(channel_for_frequency "$freq" 2>/dev/null || true)
+        if [ -z "$channel" ]; then
+          missing+=("radio|The current associated frequency is outside AWDL's supported shared-channel set (6, 44, or 149).")
+        else
+          phy=$(phy_of "$sta" 2>/dev/null || true)
+          if ! frequency_legal "$freq" "$phy"; then
+            missing+=("radio|${REG_REASON:-The current frequency is not legal for AWDL transmission.}")
+          fi
+          if ! monitor_capable "$phy"; then
+            missing+=("hardware|This radio does not advertise monitor-mode capability.")
+          fi
+        fi
+      fi
+    fi
+  fi
+  [ "${1:-}" = --json ] || { printf '%s\n' "${missing[@]:-ready}"; return 0; }
+  MISSING=$(printf '%s\n' "${missing[@]}") HW=$hw V=$VERSION C=$CONTRACT python3 -c '
+import json, os
+rows = [line.split("|", 1) for line in os.environ["MISSING"].splitlines() if line.strip()]
+print(json.dumps({"backend": "owl", "version": os.environ["V"],
+                  "contract": os.environ["C"], "hardware": os.environ["HW"] == "true",
+                  "missing": [{"id": row[0], "say": row[1]} for row in rows]},
+                 separators=(",", ":")))'
+}
+
+# ---------------------------------------------------------------- startup/teardown
+
+start_monitor() {  # STATION MAC -> sets MON
+  local sta=$1 stamac=$2 phy monmac
+  phy=$(phy_of "$sta") || return 1
+  monitor_capable "$phy" || { log 'radio has no monitor-mode capability'; return 1; }
+  MON=$(new_monitor_name) || return 1
+  atomic_state monitor-created 1
+  atomic_state monitor-station "$sta"
+  atomic_state monitor-phy "$phy"
+  atomic_state monitor-name "$MON"
+  if ! bounded iw phy "$phy" interface add "$MON" type monitor; then
+    rm -f "$RUN/monitor-created" "$RUN/monitor-station" "$RUN/monitor-phy" "$RUN/monitor-name"
+    return 1
+  fi
+  if [ "$PROF_MONMAC" = own ]; then
+    monmac="02:${stamac#*:}"
+  else
+    monmac=$stamac
+  fi
+  [[ "$monmac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || { monitor_cleanup "$sta"; return 1; }
+  if ! bounded ip link set "$MON" down \
+      || ! bounded ip link set "$MON" address "$monmac" \
+      || ! bounded ip link set "$MON" up; then
+    monitor_cleanup "$sta"
+    return 1
+  fi
+  atomic_state monitor-address "${monmac,,}"
+  monitor_identity_matches "$sta"
+}
+
+announce_once() {
+  local pid announce_exe
+  local -a announce_argv
+  announce_argv=(/usr/bin/python3 "$LIB/awdl-airdrop-adv.py" --iface "$IF" --plain
+    --flags "$ADV_FLAGS" --port 8771 --count 3 --interval 0.05)
+  announce_exe=$(readlink -f -- /usr/bin/python3 2>/dev/null || true)
+  spawn_reset "${announce_argv[@]}" >> "$RUN/announce.log" 2>&1 &
+  pid=$!
+  record_process announce "$pid" "$announce_exe" "${announce_argv[@]}" \
+    || clear_process_state announce
+  wait "$pid" 2>/dev/null || true
+  [ "$(cat "$RUN/announce.pid" 2>/dev/null)" = "$pid" ] && clear_process_state announce
+}
+
+supervise() {
+  local until
+  while true; do
+    until=$(cat "$RUN/until" 2>/dev/null || echo 0)
+    if [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt 0 ] && [ "$(date +%s)" -ge "$until" ]; then
+      exec "$SELF" stop expired
+    fi
+    if ! owned_pid owl "$OWL_BIN" >/dev/null 2>&1 || ! usable_awdl_ipv6; then
+      exec "$SELF" stop owl-exited
+    fi
+    announce_once
+    sleep "$ADV_INTERVAL"
+  done
+}
+
+reconnect_after_stop() {  # IFACE; only the saved managed device may be reactivated
+  local sta=${1:-} reconnect
+  [ -n "$sta" ] && valid_iface_name "$sta" || return 0
+  reconnect=$(knob reconnect-after)
+  case "$reconnect" in
+    0) reconnect=no ;;
+    1) reconnect=yes ;;
+    *) reconnect=$(awk '{print $4}' "$RUN/profile" 2>/dev/null) ;;
+  esac
+  [ "$reconnect" = yes ] || return 0
+  if ! bounded nmcli -w 20 device connect "$sta" >> "$RUN/log" 2>&1; then
+    log 'the saved managed device could not be reconnected after monitor teardown'
+  fi
+}
+
+cmd_stop() {
+  local why=${1:-stopped} sta
+  need_root
+  mkdir -p "$RUN"
+  exec 9> "$RUN/lock"
+  flock -w 15 9 || die 'another radio operation did not finish in time' 3
+  stop_owned_processes
+  sta=$(cat "$RUN/station" 2>/dev/null)
+  monitor_cleanup "$sta" || true
+  mt76_pm_restore
+  reconnect_after_stop "$sta"
+  rm -f "$RUN/until" "$RUN/state" "$RUN/station" "$RUN/profile" "$RUN/awdl-owned" "$RUN/owner-uid"
+  atomic_state reason "$why"
+  log "stopped ($why)"
+  return 0
+}
+
+cmd_start() {
+  local secs=${1:-} opt sta drv link verify_link bssid freq verify_freq stamac phy channel until now
+  local owl_pid supervisor_pid owl_exe supervisor_exe
+  local owl_extra=()
+  local -a owl_argv supervisor_argv
+  REQUEST_IFACE=
+  shift || true
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --interface) [ "$#" -ge 2 ] || die '--interface requires a name' 2; REQUEST_IFACE=$2; shift 2 ;;
+      *) die "unknown start option $1" 2 ;;
+    esac
+  done
+  [[ "$secs" =~ ^[0-9]+$ && ${#secs} -le 9 ]] || die 'usage: omdrop-discoverable start <seconds> [--interface NAME]' 2
+  need_root
+  mkdir -p "$RUN"
+  exec 9> "$RUN/lock"
+  flock -w 15 9 || die 'another radio operation did not finish in time' 3
+  if owned_pid supervisor '__supervise' >/dev/null 2>&1; then
+    now=$(date +%s)
+    [ "$secs" -gt 0 ] && echo $((now + secs)) > "$RUN/until" || echo 0 > "$RUN/until"
+    log "already discoverable; window extended"
+    return 5
+  fi
+  if owned_pid owl "$OWL_BIN" >/dev/null 2>&1; then
+    die 'an owned OWL process is still live without its supervisor; stop it before starting again' 3
+  fi
+  [ -x "$OWL_BIN" ] || die "the OWL executable is not installed at $OWL_BIN" 4
+  : > "$RUN/log"
+  : > "$RUN/announce.log"
+  rm -f "$RUN/reason" "$RUN/state" "$RUN/until"
+  atomic_state owner-uid "$(id -u)" || die 'could not establish radio process ownership state' 4
+
+  sta=$(station_iface 2>/dev/null || true)
+  [ -n "$sta" ] || die "${STATION_REASON:-no managed Wi-Fi interface is available}" 4
+  drv=$(driver_of "$sta" 2>/dev/null || true)
+  load_profile "$drv" || die 'no usable radio profile is installed' 4
+  profile_allowed || die "$(untested_hint)" 4
+  [ "$PROF_MODE" = shared ] || die 'this radio profile does not support shared mode' 4
+  link=
+  for opt in $(seq 1 15); do link=$(station_link "$sta" 2>/dev/null || true); [ -n "$link" ] && break; sleep 1; done
+  [ -n "$link" ] || die 'Wi-Fi is not associated; connect to a managed network and retry' 3
+  read -r bssid freq stamac <<< "$link"
+  channel=$(channel_for_frequency "$freq" 2>/dev/null || true)
+  [ -n "$channel" ] || die 'the associated frequency is outside AWDL supported channels 6, 44, and 149' 3
+  phy=$(phy_of "$sta" 2>/dev/null || true)
+  frequency_legal "$freq" "$phy" || die "${REG_REASON:-the associated frequency is not legal for AWDL transmission}" 3
+  monitor_capable "$phy" || die 'the selected radio does not advertise monitor-mode capability' 4
+  # A pre-existing awdl0 belongs to another backend unless this run has a
+  # live OWL owner.  A stale marker is not proof: after a crash another
+  # daemon may have recreated awdl0, so remove only our marker and leave the
+  # interface completely untouched.
+  if iface_exists "$IF"; then
+    if [ -e "$RUN/awdl-owned" ] && owned_pid owl "$OWL_BIN" >/dev/null 2>&1; then
+      die 'an owned OWL session is still live; stop it before starting again' 3
+    fi
+    rm -f "$RUN/awdl-owned"
+    die 'awdl0 already exists and is not owned by UCanDrop' 4
+  fi
+
+  echo "$sta" > "$RUN/station"
+  echo "$drv $PROF_MODE $PROF_MONMAC $PROF_RECONNECT $PROF_PM" > "$RUN/profile"
+  log "selected associated managed radio on channel $channel"
+  start_monitor "$sta" "$stamac" || { monitor_cleanup "$sta" || true; die 'could not create or configure an owned monitor interface' 4; }
+  [ "$PROF_MONMAC" = own ] && owl_extra=(-m "$stamac")
+  verify_link=$(station_link "$sta" 2>/dev/null || true)
+  read -r _ verify_freq _ <<< "$verify_link"
+  if [ -z "$verify_link" ] || [ "$verify_freq" != "$freq" ]; then
+    monitor_cleanup "$sta" || true
+    die 'the managed Wi-Fi association changed during radio setup' 3
+  fi
+  mt76_pm_prepare "$sta"
+  now=$(date +%s)
+  [ "$secs" -gt 0 ] && until=$((now + secs)) || until=0
+  echo "$until" > "$RUN/until"
+  atomic_state state starting
+  owl_argv=("$OWL_BIN" -i "$MON" -c "$channel" -N -S intersect
+    "${owl_extra[@]}" -v)
+  owl_exe=$(readlink -f -- "$OWL_BIN" 2>/dev/null || true)
+  [ -n "$owl_exe" ] || die 'the OWL executable has no resolvable identity' 4
+  spawn_reset "${owl_argv[@]}" > "$OWL_LOG" 2>&1 &
+  owl_pid=$!
+  if ! record_process owl "$owl_pid" "$owl_exe" "${owl_argv[@]}"; then
+    terminate_launch_process "$owl_pid" "$OWL_BIN"
+    cmd_stop owl-untracked >/dev/null 2>&1 || true
+    die 'OWL process identity could not be recorded safely' 4
+  fi
+  for opt in $(seq 1 20); do
+    iface_exists "$IF" && break
+    sleep 0.5
+  done
+  if ! iface_exists "$IF"; then
+    cmd_stop owl-failed >/dev/null 2>&1 || true
+    die 'OWL did not create the AWDL interface' 4
+  fi
+  atomic_state awdl-owned 1
+  bounded nmcli device set "$IF" managed no >/dev/null 2>&1 || true
+  bounded ip link set "$IF" up >/dev/null 2>&1 || true
+  for opt in $(seq 1 20); do usable_awdl_ipv6 && break; sleep 0.5; done
+  if ! usable_awdl_ipv6; then
+    cmd_stop awdl-not-ready >/dev/null 2>&1 || true
+    die 'AWDL did not acquire a usable IPv6 link-local address' 4
+  fi
+  supervisor_argv=(/bin/bash "$SELF" __supervise)
+  supervisor_exe=$(readlink -f -- /bin/bash 2>/dev/null || true)
+  [ -n "$supervisor_exe" ] || die 'the supervisor executable has no resolvable identity' 4
+  spawn_reset "${supervisor_argv[@]}" > /dev/null 2>&1 &
+  supervisor_pid=$!
+  if ! record_process supervisor "$supervisor_pid" "$supervisor_exe" \
+      "${supervisor_argv[@]}"; then
+    terminate_launch_process "$supervisor_pid" '__supervise'
+    cmd_stop supervisor-untracked >/dev/null 2>&1 || true
+    die 'radio supervisor identity could not be recorded safely' 4
+  fi
+  atomic_state state ready
+  atomic_state reason ''
+  log "discoverable for ${secs}s (0 = until stopped)"
+  return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-}" in
+    start) shift; cmd_start "$@" ;;
+    stop) cmd_stop "${2:-stopped}" ;;
+    status) shift; cmd_status "$@" ;;
+    peers) cmd_peers ;;
+    probe) shift; cmd_probe "$@" ;;
+    __supervise) supervise ;;
+    *) die 'usage: omdrop-discoverable start <seconds> [--interface NAME] | stop | status [--json] | peers | probe [--json]' 2 ;;
+  esac
+fi
