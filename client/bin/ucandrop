@@ -59,7 +59,7 @@ IDENTITY_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$DESKTOP_RUNTIME_DIR}/omdrop"
 # A fallback that silently substitutes for the real value is the same class of
 # defect as a status line reporting a state that was never entered, so this one
 # says when it is guessing, and says when the two disagree.
-VERSION_FALLBACK=1.1.0
+VERSION_FALLBACK=1.2.0
 ucandrop_version() {
   local dir manifest version= real
   real=$(readlink -f "$0" 2>/dev/null) || real="$0"
@@ -209,6 +209,10 @@ ucandrop -- send and receive files with nearby Apple devices
   name [NEW]        show the name, or set it (restarts a running receiver)
   dir [PATH|--pick] show the download folder, or set it (--pick: in a chooser)
   sound [on|off]    the panel's radar sound effects
+  wifi-switch [on|off]
+                    whether `on` may move Wi-Fi to an access point of the
+                    same network on a channel AirDrop can share, and hold it
+                    there until `off` (on)
   limit [PERCENT]   show the maximum transfer size, or set it to 1-90% of
                     currently free space (default 30%)
   visibility [MODE]  show, or set to "everyone" (default) or "contacts".
@@ -859,13 +863,133 @@ sys.exit(0 if parts(sys.argv[1]) >= parts(sys.argv[2]) else 1)
 PY
 }
 
-# The backend's blockers, in its order, as prereqs_missing lines.
+# The backend's blockers, in its order, as prereqs_missing lines. With
+# --except-channel, the row saying Wi-Fi is on an unshared channel is left out:
+# the caller has found an access point `on` will move to.
 probe_missing() {
-  PROBE="$RADIO_PROBE" python3 -c '
+  SKIP=${1:-} PROBE="$RADIO_PROBE" python3 -c '
 import json, os
 for m in json.loads(os.environ["PROBE"]).get("missing") or []:
+    if os.environ["SKIP"] == "--except-channel" and isinstance(m, dict) and "frequency" in m:
+        continue
     if isinstance(m, dict) and m.get("id") and m.get("say"):
         print("%s\t%s" % (m["id"], " ".join(str(m["say"]).split())))'
+}
+
+# Shared-radio AWDL needs the Wi-Fi association on one of the backend's shared
+# frequencies (6, 44 or 149). The probe says when it is not, and with which
+# frequency; one network name often has another access point on a supported
+# channel -- a mesh, or a router with two 5 GHz radios -- and NetworkManager
+# simply picked the other one. wifi_steer.py finds that access point; `on`
+# moves there and holds it with an in-memory BSSID pin until `off` (the saved
+# profile is never edited), and `doctor` says it will instead of reporting the
+# network as unusable.
+wifi_switch_on() { [[ "$(setting_get wifi-switch)" != off ]]; }
+
+cmd_wifi_switch() {
+  case "${1:-}" in
+    "")  wifi_switch_on && echo on || echo off ;;
+    on|off) setting_set wifi-switch "$1" ;;
+    *) die "usage: ucandrop wifi-switch [on|off]" ;;
+  esac
+}
+
+# "FROM SUPPORTED" when the probe reports an unshared channel, else nothing.
+probe_channel_problem() {
+  PROBE="$RADIO_PROBE" python3 -c '
+import json, os
+p = json.loads(os.environ["PROBE"])
+shared = [int(f) for f in p.get("shared_frequencies") or [] if str(f).isdigit()]
+for m in p.get("missing") or []:
+    if isinstance(m, dict) and str(m.get("frequency", "")).isdigit() and shared:
+        print(m["frequency"], ",".join(map(str, shared)))
+        break'
+}
+
+# wifi_steer.py ACTION: its JSON on stdout, its exit status, or 1 when there
+# is no channel problem, no nmcli, or the user turned switching off.
+wifi_steer() {
+  wifi_switch_on && command -v nmcli >/dev/null 2>&1 && radio_probe || return 1
+  local problem from supported
+  problem=$(probe_channel_problem)
+  [[ -n "$problem" ]] || return 1
+  read -r from supported <<<"$problem"
+  python3 "$PROJ/bin/wifi_steer.py" "$1" --from "$from" --supported "$supported"
+}
+
+# One field of wifi_steer.py's JSON, dotted for nested ones (to.channel).
+steer_field() {
+  JSON="$1" python3 -c '
+import json, os, sys
+v = json.loads(os.environ["JSON"])
+for k in sys.argv[1].split("."):
+    v = v.get(k) if isinstance(v, dict) else None
+print("" if v is None else v)' "$2"
+}
+
+# The in-memory BSSID pin `switch` leaves on the profile for the window, as
+# "UUID BSSID". Runtime state, like the pin itself: a reboot clears both.
+WIFI_PIN="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ucandrop/wifi-pin"
+
+# The backend's shared frequencies when the association is already on one,
+# comma-separated; nothing otherwise.
+probe_shared_ok() {
+  PROBE="$RADIO_PROBE" python3 -c '
+import json, os
+p = json.loads(os.environ["PROBE"])
+shared = [str(f) for f in p.get("shared_frequencies") or [] if str(f).isdigit()]
+if shared and not any(isinstance(m, dict) and "frequency" in m for m in p.get("missing") or []):
+    print(",".join(shared))'
+}
+
+# Already on a shared channel: pin that access point for the window too, with
+# no reconnect, so bgscan cannot roam the connection to a sibling on another
+# channel mid-window (the radio helper stops the session if it does anyway).
+wifi_hold() {
+  wifi_switch_on && command -v nmcli >/dev/null 2>&1 && radio_probe || return 0
+  local shared out
+  shared=$(probe_shared_ok)
+  [[ -n "$shared" ]] || return 0
+  out=$(python3 "$PROJ/bin/wifi_steer.py" hold --supported "$shared" 2>/dev/null) || return 0
+  (umask 077 && mkdir -p -- "$(dirname "$WIFI_PIN")" \
+    && printf '%s %s\n' "$(steer_field "$out" uuid)" "$(steer_field "$out" to.bssid)" > "$WIFI_PIN")
+}
+
+# Drop the pin, so the profile roams across its access points again. Every
+# window ends in `off` (timers and one-file mode call it too); a start that
+# fails releases through cmd_on's EXIT trap, and a pin left by anything else
+# is released by the next `on`.
+wifi_release() {
+  [[ -r "$WIFI_PIN" ]] || return 0
+  local uuid bssid
+  read -r uuid bssid < "$WIFI_PIN"
+  rm -f -- "$WIFI_PIN"
+  [[ -n "$uuid" && -n "$bssid" ]] && command -v nmcli >/dev/null 2>&1 || return 0
+  python3 "$PROJ/bin/wifi_steer.py" release --uuid "$uuid" --bssid "$bssid" >/dev/null 2>&1 || true
+}
+
+# Before `on` touches the radio: move to a supported access point when there is
+# one. The connection drops for a few seconds while it reassociates, so this
+# says what it is doing; when it cannot, the radio helper reports the channel.
+steer_wifi_for_on() {
+  local plan out rc
+  receiving || wifi_release
+  [[ -e "$WIFI_PIN" ]] && return 0
+  plan=$(wifi_steer plan 2>/dev/null) || { wifi_hold; return 0; }
+  printf 'Wi-Fi is on channel %s, which AirDrop cannot share. Moving to the same network'"'"'s access point on channel %s (signal %s%%); the connection pauses for a few seconds...\n' \
+    "$(steer_field "$plan" from.channel)" "$(steer_field "$plan" to.channel)" "$(steer_field "$plan" to.signal)"
+  out=$(wifi_steer switch 2>/dev/null); rc=$?
+  RADIO_PROBE=
+  if (( rc == 0 )); then
+    (umask 077 && mkdir -p -- "$(dirname "$WIFI_PIN")" \
+      && printf '%s %s\n' "$(steer_field "$out" uuid)" "$(steer_field "$out" to.bssid)" > "$WIFI_PIN")
+    printf 'Now on channel %s, held there until UCanDrop is turned off. To keep Wi-Fi where it is instead, run: ucandrop wifi-switch off\n' \
+      "$(steer_field "$out" to.channel)"
+  else
+    printf 'Could not move Wi-Fi to channel %s: %s\n' "$(steer_field "$plan" to.channel)" \
+      "$(steer_field "$out" error)" >&2
+  fi
+  return 0
 }
 
 prereqs_missing() {
@@ -876,7 +1000,12 @@ prereqs_missing() {
         || printf 'hardware\t%s\n' "This computer's Wi-Fi is not one the installed radio backend ($(probe_field backend)) can drive."
       return 0
     fi
-    probe_missing
+    if [[ -n "$(probe_channel_problem)" ]] && STEER_PLAN=$(wifi_steer plan 2>/dev/null); then
+      probe_missing --except-channel
+    else
+      STEER_PLAN=
+      probe_missing
+    fi
     receiver_libs_installed \
       || printf 'library\t%s\n' "Packages the receiver needs ($RECEIVER_PKGS) are not installed. The button below installs them."
     have_unit || printf 'service\t%s\n' "The service that receives files is not installed yet. Turning UCanDrop on installs it."
@@ -901,14 +1030,26 @@ prereqs_missing() {
 # render the first blocking sentence instead of a generic refusal, and know
 # whether the thing in the way is one it can offer to install.
 cmd_doctor() {
-  local missing=()
-  readarray -t missing < <(prereqs_missing)
+  local missing=() notice=
+  # prereqs_missing runs in the process substitution, so the access-point plan
+  # it finds comes back as a last, \x1e-marked line.
+  STEER_PLAN=
+  readarray -t missing < <(prereqs_missing; printf '\x1e%s\n' "$STEER_PLAN")
+  if [[ "${missing[-1]:-}" == $'\x1e'* ]]; then
+    STEER_PLAN=${missing[-1]#$'\x1e'}
+    unset 'missing[-1]'
+  fi
+  if [[ -n "$STEER_PLAN" ]]; then
+    notice="Wi-Fi is on channel $(steer_field "$STEER_PLAN" from.channel), which AirDrop cannot share; turning UCanDrop on moves it to the same network's access point on channel $(steer_field "$STEER_PLAN" to.channel)."
+  fi
   if [[ "${1:-}" == --json ]]; then
-    MISSING=$(printf '%s\n' "${missing[@]}") python3 -c '
+    NOTICE=$notice MISSING=$(printf '%s\n' "${missing[@]}") python3 -c '
 import json, os
 rows = [l.split("\t", 1) for l in os.environ["MISSING"].split("\n") if l.strip()]
-print(json.dumps({"ready": not rows,
-                  "missing": [{"id": r[0], "say": r[1]} for r in rows]}))'
+out = {"ready": not rows, "missing": [{"id": r[0], "say": r[1]} for r in rows]}
+if os.environ["NOTICE"]:
+    out["notices"] = [os.environ["NOTICE"]]
+print(json.dumps(out))'
     return 0
   fi
   if (( ${#missing[@]} )); then
@@ -917,6 +1058,7 @@ print(json.dumps({"ready": not rows,
   else
     printf 'Ready to receive.\n'
   fi
+  [[ -z "$notice" ]] || printf '%s\n' "$notice"
   # Which identity Apple devices will see, and anything left behind. Reported,
   # never repaired here: `ucandrop off` is the one thing that clears a window.
   printf '\n'
@@ -1060,6 +1202,12 @@ cmd_on() {
     cmd_visibility "$want_vis" >/dev/null \
       || die "ucandrop on: could not switch to $want_vis, so nothing was turned on."
   fi
+
+  # Before the identity, the watcher and the radio: none of them is up yet,
+  # so the few seconds the connection pauses cost no window time. Whatever
+  # way this start ends, a pin with no receiver behind it is let go.
+  steer_wifi_for_on
+  trap 'receiving || wifi_release' EXIT
 
   # The identity is settled before anything starts, so a cancelled start has
   # nothing to undo. `begin` makes sure the self-signed pair exists and, when
@@ -1326,6 +1474,7 @@ cmd_off() {
   [[ -x "$PRIVILEGED_DISCOVERABLE" ]] && pkexec "$PRIVILEGED_DISCOVERABLE" stop >/dev/null 2>&1 8>&-
   "$ID_PY" stop-end
   identity_unlock
+  wifi_release
   cmd_status
 }
 
@@ -1428,8 +1577,14 @@ print(json.dumps({
       else
         printf 'Visible %s as "%s" %s\n' "$audience" "$(effective_name)" "$window"
       fi ;;
-    false)   printf 'Receiving as "%s" -- %s, but NOT visible: the radio side is not advertising\n' \
-               "$(effective_name)" "$window" ;;
+    false)
+      if [[ "$reason" == channel-changed ]]; then
+        printf 'Receiving as "%s" -- %s, but NOT visible: Wi-Fi moved to another access point or channel. Turn UCanDrop off and on again.\n' \
+          "$(effective_name)" "$window"
+      else
+        printf 'Receiving as "%s" -- %s, but NOT visible: the radio side is not advertising\n' \
+          "$(effective_name)" "$window"
+      fi ;;
     unknown) printf 'Receiving as "%s" -- %s (cannot tell if anyone can see us: %s is missing)\n' \
                "$(effective_name)" "$window" "${DISCOVERABLE#$PROJ/}" ;;
   esac
@@ -2600,6 +2755,7 @@ case "${1:-status}" in
   name)   shift; cmd_name "$@" ;;
   dir)    shift; cmd_dir "$@" ;;
   sound)  shift; cmd_sound "$@" ;;
+  wifi-switch) shift; cmd_wifi_switch "$@" ;;
   limit)  shift; cmd_limit "$@" ;;
   visibility|vis|viz) shift; cmd_visibility "$@" ;;
   senders) shift; cmd_senders "$@" ;;

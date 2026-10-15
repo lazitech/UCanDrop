@@ -22,7 +22,7 @@ REG_REASON=
 STATION_REASON=
 ADV_FLAGS=137
 ADV_INTERVAL=3
-VERSION=1.1.0
+VERSION=1.2.0
 CONTRACT=0.8.1
 
 # These are AWDL's supported shared-radio AP frequencies.  They are protocol
@@ -308,6 +308,19 @@ channel_for_frequency() {
     "$AWDL_FREQ_149") printf '149\n' ;;
     *) return 1 ;;
   esac
+}
+
+# "5180 MHz, channel 36" for messages; the number alone where it has no
+# 2.4/5 GHz channel.  Display only: the gate above is channel_for_frequency.
+frequency_label() {
+  local f=${1:-}
+  if [[ "$f" =~ ^[0-9]+$ ]] && (( f >= 2412 && f <= 2472 )); then
+    printf '%s MHz, channel %s\n' "$f" $(( (f - 2407) / 5 ))
+  elif [[ "$f" =~ ^[0-9]+$ ]] && (( f >= 5000 && f < 5925 )); then
+    printf '%s MHz, channel %s\n' "$f" $(( (f - 5000) / 5 ))
+  else
+    printf '%s MHz\n' "$f"
+  fi
 }
 
 frequency_legal() {  # FREQUENCY PHY
@@ -654,7 +667,7 @@ cmd_peers() {
 }
 
 cmd_probe() {
-  local sta= drv= link= freq= phy= hw=true missing=() channel
+  local sta= drv= link= freq= phy= hw=true missing=() channel channel_say= off_freq=
   sta=$(station_iface 2>/dev/null || true)
   if [ -z "$sta" ]; then
     hw=false
@@ -677,7 +690,11 @@ cmd_probe() {
         read -r _ freq _ <<< "$link"
         channel=$(channel_for_frequency "$freq" 2>/dev/null || true)
         if [ -z "$channel" ]; then
-          missing+=("radio|The current associated frequency is outside AWDL's supported shared-channel set (6, 44, or 149).")
+          # The client can move the same network to a supported access point,
+          # so this row carries the frequency (not the BSSID or interface).
+          channel_say="Wi-Fi is on $(frequency_label "$freq"), outside AWDL's supported shared-channel set (6, 44, or 149)."
+          off_freq=$freq
+          missing+=("radio|$channel_say")
         else
           phy=$(phy_of "$sta" 2>/dev/null || true)
           if ! frequency_legal "$freq" "$phy"; then
@@ -691,12 +708,21 @@ cmd_probe() {
     fi
   fi
   [ "${1:-}" = --json ] || { printf '%s\n' "${missing[@]:-ready}"; return 0; }
-  MISSING=$(printf '%s\n' "${missing[@]}") HW=$hw V=$VERSION C=$CONTRACT python3 -c '
+  MISSING=$(printf '%s\n' "${missing[@]}") HW=$hw V=$VERSION C=$CONTRACT \
+  CHANNEL_SAY=$channel_say OFF_FREQ=$off_freq \
+  SHARED="$AWDL_FREQ_24 $AWDL_FREQ_44 $AWDL_FREQ_149" python3 -c '
 import json, os
 rows = [line.split("|", 1) for line in os.environ["MISSING"].splitlines() if line.strip()]
+missing = []
+for row in rows:
+    item = {"id": row[0], "say": row[1]}
+    if os.environ["OFF_FREQ"] and row[1] == os.environ["CHANNEL_SAY"]:
+        item["frequency"] = int(os.environ["OFF_FREQ"])
+    missing.append(item)
 print(json.dumps({"backend": "owl", "version": os.environ["V"],
                   "contract": os.environ["C"], "hardware": os.environ["HW"] == "true",
-                  "missing": [{"id": row[0], "say": row[1]} for row in rows]},
+                  "shared_frequencies": [int(f) for f in os.environ["SHARED"].split()],
+                  "missing": missing},
                  separators=(",", ":")))'
 }
 
@@ -745,6 +771,20 @@ announce_once() {
   [ "$(cat "$RUN/announce.pid" 2>/dev/null)" = "$pid" ] && clear_process_state announce
 }
 
+# OWL is held on the channel it started on (-c), so an association that moves
+# to any other frequency -- NetworkManager's bgscan roaming to a sibling access
+# point, say -- leaves a session that looks healthy and can carry nothing.
+# A link that is momentarily down is not a move; only a different frequency is.
+associated_elsewhere() {
+  local sta want link freq
+  sta=$(cat "$RUN/station" 2>/dev/null)
+  want=$(cat "$RUN/station-freq" 2>/dev/null)
+  [ -n "$sta" ] && [[ "$want" =~ ^[0-9]+$ ]] || return 1
+  link=$(station_link "$sta" 2>/dev/null) || return 1
+  read -r _ freq _ <<< "$link"
+  [ -n "$freq" ] && [ "$freq" != "$want" ]
+}
+
 supervise() {
   local until
   while true; do
@@ -754,6 +794,10 @@ supervise() {
     fi
     if ! owned_pid owl "$OWL_BIN" >/dev/null 2>&1 || ! usable_awdl_ipv6; then
       exec "$SELF" stop owl-exited
+    fi
+    if associated_elsewhere; then
+      log "the managed association left the session's frequency $(cat "$RUN/station-freq" 2>/dev/null) MHz"
+      exec "$SELF" stop channel-changed
     fi
     announce_once
     sleep "$ADV_INTERVAL"
@@ -786,7 +830,7 @@ cmd_stop() {
   monitor_cleanup "$sta" || true
   mt76_pm_restore
   reconnect_after_stop "$sta"
-  rm -f "$RUN/until" "$RUN/state" "$RUN/station" "$RUN/profile" "$RUN/awdl-owned" "$RUN/owner-uid"
+  rm -f "$RUN/until" "$RUN/state" "$RUN/station" "$RUN/station-freq" "$RUN/profile" "$RUN/awdl-owned" "$RUN/owner-uid"
   atomic_state reason "$why"
   log "stopped ($why)"
   return 0
@@ -836,7 +880,7 @@ cmd_start() {
   [ -n "$link" ] || die 'Wi-Fi is not associated; connect to a managed network and retry' 3
   read -r bssid freq stamac <<< "$link"
   channel=$(channel_for_frequency "$freq" 2>/dev/null || true)
-  [ -n "$channel" ] || die 'the associated frequency is outside AWDL supported channels 6, 44, and 149' 3
+  [ -n "$channel" ] || die "Wi-Fi is on $(frequency_label "$freq"), outside AWDL supported channels 6, 44, and 149" 3
   phy=$(phy_of "$sta" 2>/dev/null || true)
   frequency_legal "$freq" "$phy" || die "${REG_REASON:-the associated frequency is not legal for AWDL transmission}" 3
   monitor_capable "$phy" || die 'the selected radio does not advertise monitor-mode capability' 4
@@ -853,6 +897,7 @@ cmd_start() {
   fi
 
   echo "$sta" > "$RUN/station"
+  echo "$freq" > "$RUN/station-freq"
   echo "$drv $PROF_MODE $PROF_MONMAC $PROF_RECONNECT $PROF_PM" > "$RUN/profile"
   log "selected associated managed radio on channel $channel"
   start_monitor "$sta" "$stamac" || { monitor_cleanup "$sta" || true; die 'could not create or configure an owned monitor interface' 4; }

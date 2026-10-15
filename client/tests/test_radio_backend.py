@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from test_wifi_steer import air, install_fake_nmcli
+
 
 ROOT = Path(__file__).resolve().parents[1]
 OMDROP = ROOT / "bin" / "ucandrop"
@@ -116,6 +118,39 @@ class RadioBackendTests(unittest.TestCase):
         self.assertNotIn("pacman", result.stdout)
         for broadcom in ("brcmfmac-awdl-dkms", "makepkg", "omdrop-awdl"):
             self.assertNotIn(broadcom, result.stdout)
+
+    CHANNEL_PROBE = {
+        "backend": "owl", "version": "1.1.0", "hardware": True, "contract": "0.8.1",
+        "shared_frequencies": [2437, 5220, 5745],
+        "missing": [{"id": "radio", "frequency": 5180,
+                     "say": "Wi-Fi is on 5180 MHz, channel 36, outside AWDL's supported shared-channel set (6, 44, or 149)."}]}
+
+    def test_an_unshared_channel_with_a_supported_access_point_is_not_a_blocker(self):
+        self.command("omdrop-discoverable", helper(self.CHANNEL_PROBE))
+        self.env.update(install_fake_nmcli(self.bin, air()))
+        report = self.doctor()
+        self.assertTrue({m["id"] for m in report["missing"]} <= {"library"}, report)
+        self.assertEqual(len(report["notices"]), 1)
+        self.assertIn("channel 36", report["notices"][0])
+        self.assertIn("channel 149", report["notices"][0])
+
+    def test_an_unshared_channel_without_one_still_blocks(self):
+        state = air()
+        state["aps"]["wlan0"] = [ap for ap in state["aps"]["wlan0"] if ap["freq"] == 5180]
+        self.command("omdrop-discoverable", helper(self.CHANNEL_PROBE))
+        self.env.update(install_fake_nmcli(self.bin, state))
+        report = self.doctor()
+        self.assertIn("5180 MHz, channel 36", json.dumps(report["missing"]))
+        self.assertNotIn("notices", report)
+
+    def test_switching_turned_off_keeps_the_channel_blocker(self):
+        self.command("omdrop-discoverable", helper(self.CHANNEL_PROBE))
+        self.env.update(install_fake_nmcli(self.bin, air()))
+        self.assertEqual(self.omdrop("wifi-switch", "off").returncode, 0)
+        self.assertEqual(self.omdrop("wifi-switch").stdout.strip(), "off")
+        report = self.doctor()
+        self.assertIn("channel 36", json.dumps(report["missing"]))
+        self.assertNotIn("notices", report)
 
     def test_install_with_a_probing_backend_and_nothing_missing_does_nothing(self):
         self.command("omdrop-discoverable", helper({

@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-VERSION=1.1.0
+VERSION=1.2.0
 OUTPUT_DIR=${UCANDROP_OUTPUT_DIR:-$ROOT/dist}
 
 BUILD_DEPS=(
@@ -87,8 +87,8 @@ read_os_value() {
 
 OS_ID=$(read_os_value ID)
 OS_VERSION=$(read_os_value VERSION_ID)
-[[ $OS_ID == ubuntu ]] || die "UCanDrop 1.1.0 targets Ubuntu 26.04; detected ${OS_ID:-unknown}"
-[[ $OS_VERSION == 26.04 ]] || die "UCanDrop 1.1.0 targets Ubuntu 26.04; detected ${OS_VERSION:-unknown}"
+[[ $OS_ID == ubuntu ]] || die "UCanDrop 1.2.0 targets Ubuntu 26.04; detected ${OS_ID:-unknown}"
+[[ $OS_VERSION == 26.04 ]] || die "UCanDrop 1.2.0 targets Ubuntu 26.04; detected ${OS_VERSION:-unknown}"
 
 ARCH=$(dpkg --print-architecture)
 case $ARCH in
@@ -102,8 +102,8 @@ for input in \
     "$ROOT/packaging/control"; do
     [[ -e $input ]] || die "missing release input: $input"
 done
-grep -Eq '"version"[[:space:]]*:[[:space:]]*"1\.1\.0"' "$ROOT/client/manifest.json" \
-    || die 'client/manifest.json must declare version 1.1.0'
+grep -Eq '"version"[[:space:]]*:[[:space:]]*"1\.2\.0"' "$ROOT/client/manifest.json" \
+    || die 'client/manifest.json must declare version 1.2.0'
 
 missing_tools=()
 for command in cmake cc c++ strip dpkg-deb sha256sum; do

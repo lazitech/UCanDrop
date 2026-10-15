@@ -230,6 +230,43 @@ class RadioFixture(unittest.TestCase):
         self.assertNotIn("02:00:00:00:00:02", serialized)
         self.assertNotIn("radio0", serialized)
 
+    def probe(self, frequency: int) -> dict:
+        _, root = self.make_root()
+        self.add_wifi(root)
+        self.iw_fixture(root, frequency=frequency)
+        (root / "conf" / "allow-untested").write_text("1\n")
+        (root / "bin" / "owl").write_text("#!/bin/bash\nexit 0\n")
+        (root / "bin" / "owl").chmod(0o755)
+        result = self.run_bash(root, "cmd_probe --json\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_probe_names_an_unshared_frequency_for_the_client_to_steer(self) -> None:
+        report = self.probe(5180)
+        self.assertEqual(report["shared_frequencies"], [2437, 5220, 5745])
+        rows = [item for item in report["missing"] if "frequency" in item]
+        self.assertEqual(len(rows), 1, report)
+        self.assertEqual(rows[0]["id"], "radio")
+        self.assertEqual(rows[0]["frequency"], 5180)
+        self.assertIn("5180 MHz, channel 36", rows[0]["say"])
+        self.assertNotIn("02:00:00:00:00:01", json.dumps(report))
+
+    def test_probe_on_a_shared_frequency_names_no_frequency(self) -> None:
+        report = self.probe(5745)
+        self.assertFalse([item for item in report["missing"] if "frequency" in item], report)
+
+    def test_supervisor_notices_the_association_leaving_the_session_frequency(self) -> None:
+        for now, connected, moved in ((5180, True, True), (5745, True, False), (5180, False, False)):
+            with self.subTest(now=now, connected=connected):
+                _, root = self.make_root()
+                self.add_wifi(root)
+                self.iw_fixture(root, frequency=now, connected=connected)
+                (root / "run" / "station").write_text("radio0\n")
+                (root / "run" / "station-freq").write_text("5745\n")
+                result = self.run_bash(root, "if associated_elsewhere; then echo moved; else echo stayed; fi\n")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "moved" if moved else "stayed")
+
     def test_shared_channel_mapping_rejects_arbitrary_legal_frequency(self) -> None:
         _, root = self.make_root()
         result = self.run_bash(

@@ -344,7 +344,7 @@ static int parse_freq_support(struct nl_msg *msg, void *arg)
 							log_debug("Channel %d [%d MHz] is disabled", ieee80211_frequency_to_channel(freq), freq);
 						if (tb_freq[NL80211_FREQUENCY_ATTR_NO_IR])
 							log_debug("Channel %d [%d MHz] does not allow to initiate radiation first (no IR)", ieee80211_frequency_to_channel(freq), freq);
-						log_warn("Cannot inject frames on channel %d [%d MHz], try setting a regulatory domain (`iw reg set <CC>`) or using a different channel (6, 49, or 149)", ieee80211_frequency_to_channel(freq), freq);
+						log_warn("Cannot inject frames on channel %d [%d MHz], try setting a regulatory domain (`iw reg set <CC>`) or using a different channel (6, 44, or 149)", ieee80211_frequency_to_channel(freq), freq);
 						continue;
 					}
 

@@ -77,7 +77,7 @@ def inspect_package(path: Path) -> list[str]:
     errors = []
     if not re.search(r'^Package: ucandrop$', fields, re.MULTILINE):
         errors.append('package: incorrect package name')
-    if not re.search(r'^Version: 1\.1\.0(?:-[0-9]+)?$', fields, re.MULTILINE):
+    if not re.search(r'^Version: 1\.2\.0(?:-[0-9]+)?$', fields, re.MULTILINE):
         errors.append('package: incorrect release version')
     for dependency in ('python3-gi', 'python3-libarchive-c', 'network-manager',
                        'pkexec', 'libnl-3', 'libpcap', 'libev', 'xdg-user-dirs'):

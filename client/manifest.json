@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ucandrop",
   "name": "UCanDrop",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "UCanDrop contributors",
   "license": "MIT",
   "description": "Send and receive files with nearby Apple devices over AirDrop on Ubuntu and other Linux desktops with a compatible radio backend.",

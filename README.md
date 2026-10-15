@@ -12,12 +12,12 @@ The target system is **Ubuntu 26.04 Desktop**, with GNOME as the reference
 desktop. Bluetooth and a compatible Wi-Fi adapter are required; see
 “Compatibility” below for wireless requirements.
 
-Download **`ucandrop_1.1.0_amd64.deb`** from the
-[release assets](https://github.com/lazitech/ucandrop/releases/tag/v1.1.0),
+Download **`ucandrop_1.2.0_amd64.deb`** from the
+[release assets](https://github.com/lazitech/ucandrop/releases/tag/v1.2.0),
 open a terminal in the directory containing the file, and run:
 
 ```bash
-sudo apt install ./ucandrop_1.1.0_amd64.deb
+sudo apt install ./ucandrop_1.2.0_amd64.deb
 ucandrop setup
 ```
 
@@ -100,7 +100,22 @@ the table below and be permitted by the local regulatory domain:
 A 6 GHz channel with the same number cannot substitute for these frequencies.
 The program reads the actual connection and regulatory restrictions. It
 does not depend on internet access or gateway ping responses, and it does
-not change the router or automatically disconnect Wi-Fi.
+not change the router.
+
+When the connection is on another channel but the same network name has an
+access point in range on a supported one (a mesh, or a router with two 5 GHz
+radios), `ucandrop on` moves the same NetworkManager profile to that access
+point; the connection pauses for a few seconds. Whether it moved or was
+already on a supported channel, the access point is held until UCanDrop is
+turned off, so Wi-Fi cannot roam to another channel while receiving. The hold
+is in memory only: the saved profile is not edited, and a profile you pinned
+to a BSSID yourself is left alone.
+
+This needs NetworkManager to allow the change without a password (on Ubuntu,
+members of the sudo or netdev group); otherwise the channel is reported
+instead. Turn it off with `ucandrop wifi-switch off`. If no such access point
+exists, set the router's 5 GHz channel to 44 or 149 (or its 2.4 GHz channel
+to 6).
 
 Unknown drivers are marked as untested. After reviewing the check results,
 if you decide to try one, run:
@@ -116,7 +131,7 @@ Remove `/etc/ucandrop/allow-untested` to restore the default policy.
 ## Install from source (optional)
 
 To build the project yourself, modify the code or use arm64, download and
-extract the [source archive](https://github.com/lazitech/ucandrop/releases/download/v1.1.0/ucandrop-1.1.0-source.tar.gz).
+extract the [source archive](https://github.com/lazitech/ucandrop/releases/download/v1.2.0/ucandrop-1.2.0-source.tar.gz).
 From the project directory, run as your ordinary desktop user:
 
 ```bash
@@ -152,7 +167,7 @@ dependencies installed, run:
 ./tools/build-deb.sh
 python3 -m unittest discover -s tests
 python3 -m unittest discover -s client/tests
-python3 tools/verify-release.py --package dist/ucandrop_1.1.0_amd64.deb
+python3 tools/verify-release.py --package dist/ucandrop_1.2.0_amd64.deb
 ```
 
 Use the package filename for the architecture actually built. Builds are

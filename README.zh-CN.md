@@ -10,10 +10,10 @@
 目标系统是 **Ubuntu 26.04 桌面版**，GNOME 为参考桌面。需要蓝牙和兼容的无线网卡；
 无线要求见下方「兼容范围」。
 
-下载[发布附件](https://github.com/lazitech/ucandrop/releases/tag/v1.1.0)中的 **`ucandrop_1.1.0_amd64.deb`**，在该文件所在目录打开终端，运行：
+下载[发布附件](https://github.com/lazitech/ucandrop/releases/tag/v1.2.0)中的 **`ucandrop_1.2.0_amd64.deb`**，在该文件所在目录打开终端，运行：
 
 ```bash
-sudo apt install ./ucandrop_1.1.0_amd64.deb
+sudo apt install ./ucandrop_1.2.0_amd64.deb
 ucandrop setup
 ```
 
@@ -84,7 +84,17 @@ ucandrop send /path/to/file --pick
 | 5 GHz | 149 | 5745 MHz |
 
 6 GHz 中相同编号的信道不能替代这些频率。程序读取实际连接及法规限制，
-不依赖互联网或网关回应 ping，也不会修改路由器或自动断开 Wi-Fi。
+不依赖互联网或网关回应 ping，也不会修改路由器。
+
+如果当前连接不在上述信道，但同名网络在附近有位于受支持信道的接入点（例如 Mesh，
+或带两个 5 GHz 射频的路由器），`ucandrop on` 会让同一个 NetworkManager 配置改连该接入点，
+期间网络会中断几秒。无论是否切换过，接收期间都会锁定当前接入点，直到关闭 UCanDrop，
+避免 Wi-Fi 在接收过程中漫游到其他信道。这一锁定只存在于内存中：已保存的配置不会被修改，
+用户自己锁定了 BSSID 的配置保持不动。
+
+此功能要求 NetworkManager 无需密码即可修改配置（Ubuntu 上为 sudo 或 netdev 组成员），
+否则只会报告信道问题。可用 `ucandrop wifi-switch off` 关闭此行为。若附近没有这样的接入点，
+请将路由器的 5 GHz 信道设为 44 或 149（或 2.4 GHz 信道设为 6）。
 
 未知驱动会被标为未经验证。查看检查结果后，若决定尝试，可运行：
 
@@ -98,7 +108,7 @@ ucandrop doctor --json
 
 ## 从源码安装（可选）
 
-需要自行构建、修改代码或使用 arm64 时，下载并解压[源码压缩包](https://github.com/lazitech/ucandrop/releases/download/v1.1.0/ucandrop-1.1.0-source.tar.gz)，
+需要自行构建、修改代码或使用 arm64 时，下载并解压[源码压缩包](https://github.com/lazitech/ucandrop/releases/download/v1.2.0/ucandrop-1.2.0-source.tar.gz)，
 在项目目录中以普通桌面用户运行：
 
 ```bash

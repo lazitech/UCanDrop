@@ -12,7 +12,7 @@ from pathlib import Path
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
-EPOCH = 1791590400
+EPOCH = 1791936000
 spec = importlib.util.spec_from_file_location('verify_release', ROOT / 'tools/verify-release.py')
 audit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(audit)

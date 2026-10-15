@@ -1,18 +1,18 @@
-# UCanDrop 1.1.0 release validation
+# UCanDrop 1.2.0 release validation
 
 The release was built and checked on Ubuntu 26.04, native amd64. These results
 validate the included implementation and distribution artifacts. They do not
 establish physical compatibility with every Wi-Fi adapter, network, Apple
-device or iOS version. No installed receiver, radio service or network
-configuration was changed during release validation.
+device or iOS version. Saved network profiles were not changed during
+release validation; the access-point checks below changed only in-memory
+NetworkManager state, which was released afterwards.
 
 ## Automated checks
 
 | Check | Result |
 | --- | --- |
-| Release, installation, client portability, radio and receiver suite | 58 passed |
-| Full client suite | 205 passed, 2 environment-dependent tests skipped |
-| Focused radio lifecycle suite | 16 passed; 20 repeated runs passed |
+| Release, installation, client portability, radio and receiver suite | 61 passed |
+| Full client suite | 226 passed, 2 environment-dependent tests skipped |
 | Native OWL and Debian package build | Passed |
 | Source and extracted package privacy/content audit | Passed |
 | Relocated clean native build | Passed |
@@ -24,6 +24,35 @@ colocated OWL helper is probed rather than falling back to the upstream Apple
 hardware check. Frequency fixtures cover both integer and zero-decimal MHz
 fields from iw, including rejection of a decimal no-IR entry. These tests
 failed with the original packaged implementation and pass with the fixes.
+
+1.2.0 adds access-point steering. `client/tests/test_wifi_steer.py` drives
+`wifi_steer.py` against a simulated nmcli that, like NetworkManager 1.54 on
+real hardware, lets wpa_supplicant pick the strongest access point unless the
+profile carries a BSSID. It covers choosing a supported access point of the
+same network, never another network name, user-pinned profiles, users
+without password-free permission, colon-escaped SSIDs, the in-memory pin,
+activation failure, landing on the wrong access point, and releasing only the
+pin UCanDrop set. Doctor and probe tests cover the new `frequency`,
+`shared_frequencies` and `notices` fields, and the supervisor test covers a
+session whose association leaves its frequency.
+
+## Hardware checks
+
+Ubuntu 26.04, mt7925e, NetworkManager 1.54.3, one network name served by
+access points on channels 6, 36 and 149:
+
+| Check | Result |
+| --- | --- |
+| `nmcli connection up ... ap BSSID` alone | Rejected approach: reassociated to the stronger channel-36 access point |
+| From channel 36, `ucandrop on` (source client) | Moved to channel 149 in about 13 s; profile pinned in memory; radio visible |
+| From channel 149, `ucandrop on` (source client) | Pinned in place with the same active connection (no reconnect); radio visible |
+| `ucandrop off` after either | Pin released, runtime record removed, Wi-Fi reassociated |
+| Installed 1.2.0 package: move from channel 36, hold on 149, release on `off` | Passed |
+| iPhone photo transfer after an automatic move from channel 36 | Passed (2.6 MB JPEG stored) |
+| iPhone photo transfer with the access point held on channel 149 | Passed (2.6 MB JPEG stored) |
+| Association forced to channel 36 mid-window | Session stopped as `channel-changed`; status said so; a pin changed by the user was left in place |
+| `wifi-switch off` on channel 36 | Doctor reported the channel as a blocker; `on` refused without touching Wi-Fi |
+| Start cancelled after a move | Not exercised on hardware; covered by the EXIT-trap release path only |
 
 The client skips were:
 
@@ -77,7 +106,7 @@ and test dependencies installed:
 ./tools/build-deb.sh --jobs 2
 python3 -m unittest discover -s tests -v
 python3 -m unittest discover -s client/tests -v
-python3 tools/verify-release.py --package dist/ucandrop_1.1.0_amd64.deb
+python3 tools/verify-release.py --package dist/ucandrop_1.2.0_amd64.deb
 python3 tools/export-release.py
 ```
 
