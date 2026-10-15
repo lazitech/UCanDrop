@@ -1,4 +1,4 @@
-# UCanDrop 1.2.0 release validation
+# UCanDrop 1.2.1 release validation
 
 The release was built and checked on Ubuntu 26.04, native amd64. These results
 validate the included implementation and distribution artifacts. They do not
@@ -12,7 +12,7 @@ NetworkManager state, which was released afterwards.
 | Check | Result |
 | --- | --- |
 | Release, installation, client portability, radio and receiver suite | 61 passed |
-| Full client suite | 226 passed, 2 environment-dependent tests skipped |
+| Full client suite | 232 passed, 2 environment-dependent tests skipped |
 | Native OWL and Debian package build | Passed |
 | Source and extracted package privacy/content audit | Passed |
 | Relocated clean native build | Passed |
@@ -36,6 +36,13 @@ pin UCanDrop set. Doctor and probe tests cover the new `frequency`,
 `shared_frequencies` and `notices` fields, and the supervisor test covers a
 session whose association leaves its frequency.
 
+1.2.1 adds `doctor` and `on` advice for a channel `on` cannot fix (no
+supported access point, switching turned off, a password-protected change, a
+BSSID lock), keeps the access-point pin record across logout, refuses such a
+start before saving a visibility change, and names 6 GHz associations. Tests
+cover each advice case, releasing a record from the new and the 1.2.0
+location, a stale record after a reboot, and the 6 GHz label.
+
 ## Hardware checks
 
 Ubuntu 26.04, mt7925e, NetworkManager 1.54.3, one network name served by
@@ -53,6 +60,12 @@ access points on channels 6, 36 and 149:
 | Association forced to channel 36 mid-window | Session stopped as `channel-changed`; status said so; a pin changed by the user was left in place |
 | `wifi-switch off` on channel 36 | Doctor reported the channel as a blocker; `on` refused without touching Wi-Fi |
 | Start cancelled after a move | Not exercised on hardware; covered by the EXIT-trap release path only |
+| 1.2.1, channel 36 with `wifi-switch off` | `doctor`, `doctor --json` and `on` named the channel 149 access point and `ucandrop wifi-switch on`; `on` exited before starting anything and left Wi-Fi unchanged |
+| 1.2.1 (source client), move from channel 36 | Moved to channel 149; pin record written under `~/.local/state/ucandrop`; released on `off` |
+
+The single-router case (no access point on a supported channel), the
+password-protected case and the BSSID-lock case were checked against the
+simulated nmcli only.
 
 The client skips were:
 
@@ -106,7 +119,7 @@ and test dependencies installed:
 ./tools/build-deb.sh --jobs 2
 python3 -m unittest discover -s tests -v
 python3 -m unittest discover -s client/tests -v
-python3 tools/verify-release.py --package dist/ucandrop_1.2.0_amd64.deb
+python3 tools/verify-release.py --package dist/ucandrop_1.2.1_amd64.deb
 python3 tools/export-release.py
 ```
 

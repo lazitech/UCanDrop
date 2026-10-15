@@ -84,7 +84,7 @@ class ClientPortabilityTests(unittest.TestCase):
         manifest = json.loads((CLIENT / "manifest.json").read_text())
         self.assertEqual(manifest["id"], "ucandrop")
         self.assertEqual(manifest["name"], "UCanDrop")
-        self.assertEqual(manifest["version"], "1.2.0")
+        self.assertEqual(manifest["version"], "1.2.1")
         self.assertEqual(manifest["author"], "UCanDrop contributors")
         self.assertEqual(manifest["kinds"], ["cli"])
         self.assertNotIn("entryPoints", manifest)
@@ -102,7 +102,7 @@ class ClientPortabilityTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertEqual(run.stdout.strip(), "ucandrop 1.2.0")
+        self.assertEqual(run.stdout.strip(), "ucandrop 1.2.1")
 
     def test_runtime_sources_have_no_account_or_installed_omdrop_path(self):
         paths = [*BIN.glob("*.py"), BIN / "ucandrop", *CLIENT.glob("share/**/*"),

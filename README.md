@@ -12,12 +12,12 @@ The target system is **Ubuntu 26.04 Desktop**, with GNOME as the reference
 desktop. Bluetooth and a compatible Wi-Fi adapter are required; see
 “Compatibility” below for wireless requirements.
 
-Download **`ucandrop_1.2.0_amd64.deb`** from the
-[release assets](https://github.com/lazitech/ucandrop/releases/tag/v1.2.0),
+Download **`ucandrop_1.2.1_amd64.deb`** from the
+[release assets](https://github.com/lazitech/ucandrop/releases/tag/v1.2.1),
 open a terminal in the directory containing the file, and run:
 
 ```bash
-sudo apt install ./ucandrop_1.2.0_amd64.deb
+sudo apt install ./ucandrop_1.2.1_amd64.deb
 ucandrop setup
 ```
 
@@ -131,7 +131,7 @@ Remove `/etc/ucandrop/allow-untested` to restore the default policy.
 ## Install from source (optional)
 
 To build the project yourself, modify the code or use arm64, download and
-extract the [source archive](https://github.com/lazitech/ucandrop/releases/download/v1.2.0/ucandrop-1.2.0-source.tar.gz).
+extract the [source archive](https://github.com/lazitech/ucandrop/releases/download/v1.2.1/ucandrop-1.2.1-source.tar.gz).
 From the project directory, run as your ordinary desktop user:
 
 ```bash
@@ -167,7 +167,7 @@ dependencies installed, run:
 ./tools/build-deb.sh
 python3 -m unittest discover -s tests
 python3 -m unittest discover -s client/tests
-python3 tools/verify-release.py --package dist/ucandrop_1.2.0_amd64.deb
+python3 tools/verify-release.py --package dist/ucandrop_1.2.1_amd64.deb
 ```
 
 Use the package filename for the architecture actually built. Builds are

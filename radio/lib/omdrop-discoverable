@@ -22,7 +22,7 @@ REG_REASON=
 STATION_REASON=
 ADV_FLAGS=137
 ADV_INTERVAL=3
-VERSION=1.2.0
+VERSION=1.2.1
 CONTRACT=0.8.1
 
 # These are AWDL's supported shared-radio AP frequencies.  They are protocol

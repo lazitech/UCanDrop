@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STEER = ROOT / "bin" / "wifi_steer.py"
+UCANDROP = ROOT / "bin" / "ucandrop"
 SHARED = "2437,5220,5745"
 
 FAKE_NMCLI = r'''#!/usr/bin/env python3
@@ -138,6 +139,13 @@ class WifiSteerTests(unittest.TestCase):
         self.assertEqual(plan["from"]["channel"], 36)
         self.assertEqual(plan["uuid"], "f5c57ecd-5527-4bb5-b1a7-d697ff1ccc8d")
 
+    def test_a_6ghz_association_is_named_as_such(self):
+        state = air()
+        state["aps"]["wlan0"][0]["freq"] = 6135
+        rc, plan, _ = self.steer("plan", state, current=6135)
+        self.assertEqual(rc, 0, plan)
+        self.assertEqual(plan["from"]["channel"], "37 (6 GHz)")
+
     def test_falls_back_to_channel_6_when_5ghz_is_too_weak(self):
         state = air()
         state["aps"]["wlan0"][2]["signal"] = 25
@@ -153,13 +161,17 @@ class WifiSteerTests(unittest.TestCase):
 
     def test_a_profile_pinned_to_a_bssid_is_left_alone(self):
         rc, plan, _ = self.steer("plan", air(pinned={"f5c57ecd-5527-4bb5-b1a7-d697ff1ccc8d": "84:70:D7:6F:4E:A6"}))
-        self.assertEqual((rc, plan), (1, {"reason": "pinned"}))
+        self.assertEqual(rc, 1)
+        self.assertEqual(plan["reason"], "pinned")
+        self.assertEqual(plan["to"]["channel"], 149)
 
     def test_a_user_who_would_be_asked_for_a_password_is_never_steered(self):
         state = air()
         state["permissions"]["org.freedesktop.NetworkManager.settings.modify.system"] = "auth"
         rc, plan, calls = self.steer("plan", state)
-        self.assertEqual((rc, plan), (1, {"reason": "no-permission"}))
+        self.assertEqual(rc, 1)
+        self.assertEqual(plan["reason"], "no-permission")
+        self.assertEqual(plan["to"]["channel"], 149)
         rc, out, calls = self.steer("hold", air(in_use={"wlan0": "84:70:D7:6F:4E:A8"},
                                                 permissions=state["permissions"]),
                                     args=["--supported", SHARED])
@@ -243,6 +255,55 @@ class WifiSteerTests(unittest.TestCase):
         rc, out, calls = self.steer("release", air(pinned={self.UUID: "84:70:D7:6F:4E:A7"}),
                                     args=["--uuid", self.UUID, "--bssid", "84:70:d7:6f:4e:a8"])
         self.assertEqual((rc, out), (0, {"released": False}))
+        self.assertFalse([c for c in calls if "modify" in c])
+
+
+
+class PinRecordTests(unittest.TestCase):
+    """`ucandrop`'s wifi_release, extracted and run against the fake nmcli."""
+    UUID = "f5c57ecd-5527-4bb5-b1a7-d697ff1ccc8d"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.state_record = self.root / "state" / "ucandrop" / "wifi-pin"
+        self.runtime_record = self.root / "run" / "ucandrop" / "wifi-pin"
+
+    def release(self, state, record):
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(f"{self.UUID} 84:70:d7:6f:4e:a8\n")
+        source = UCANDROP.read_text()
+        start = source.index("\n# The in-memory BSSID pin")
+        end = source.index("\n# Before `on` touches the radio")
+        env = os.environ.copy()
+        env.update(install_fake_nmcli(self.bin, state))
+        env.update(PATH=f"{self.bin}:{env['PATH']}",
+                   XDG_STATE_HOME=str(self.root / "state"),
+                   XDG_RUNTIME_DIR=str(self.root / "run"),
+                   HOME=str(self.root))
+        harness = f"PROJ={ROOT}\n{source[start:end]}\nwifi_release\n"
+        result = subprocess.run(["bash", "-c", harness], env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(record.exists())
+        log = self.bin / "nm-state.json.log"
+        calls = [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+        return json.loads((self.bin / "nm-state.json").read_text()), calls
+
+    def test_the_record_survives_logout_and_releases_the_pin(self):
+        state, _ = self.release(air(pinned={self.UUID: "84:70:D7:6F:4E:A8"}), self.state_record)
+        self.assertEqual(state["pinned"][self.UUID], "")
+
+    def test_a_window_opened_by_1_2_0_is_still_released(self):
+        state, _ = self.release(air(pinned={self.UUID: "84:70:D7:6F:4E:A8"}), self.runtime_record)
+        self.assertEqual(state["pinned"][self.UUID], "")
+
+    def test_after_a_reboot_the_stale_record_changes_nothing(self):
+        _, calls = self.release(air(), self.state_record)
         self.assertFalse([c for c in calls if "modify" in c])
 
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.1
+
+- When `on` cannot fix an unsupported channel, `doctor` and `on` now say what
+  to do: set the router to channel 44 or 149 when no access point of the
+  network uses a supported channel, run `ucandrop wifi-switch on` when
+  switching is off, join the netdev group when NetworkManager would ask for a
+  password, or clear a BSSID lock. `on` stops before starting anything,
+  including before saving a `-c`/`-e` visibility change.
+- The access-point pin record moved from the runtime directory to
+  `~/.local/state/ucandrop/`, so logging out without `ucandrop off` no longer
+  leaves the connection pinned with no record; the next `on` or `off`
+  releases it. Records left by 1.2.0 are still released.
+- A 6 GHz association is named as such ("channel 37 (6 GHz)") instead of an
+  empty channel.
+
 ## 1.2.0
 
 - When Wi-Fi is associated on a channel AWDL cannot share, `ucandrop on` moves

@@ -53,6 +53,7 @@ identity_lock() {{ :; }}
 identity_unlock() {{ :; }}
 cancel_window() {{ :; }}
 cmd_status() {{ :; }}
+wifi_release() {{ :; }}
 systemctl() {{ printf 'systemctl %s\\n' "$*" >> "$CAPTURE"; }}
 {source[start:end]}
 cmd_off {" ".join(args)}

@@ -10,8 +10,8 @@ set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 BUILD_DIR=${UCANDROP_BUILD_DIR:-$ROOT/build}
 OUTPUT_DIR=${UCANDROP_OUTPUT_DIR:-$ROOT/dist}
-SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1791936000}
-VERSION=1.2.0
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1792022400}
+VERSION=1.2.1
 PACKAGE=ucandrop
 
 die() {
@@ -23,9 +23,9 @@ usage() {
     cat <<'EOF'
 Usage: tools/build-deb.sh [--clean] [--jobs N]
 
-Build the native-architecture ucandrop_1.2.0_<arch>.deb.  Set
+Build the native-architecture ucandrop_1.2.1_<arch>.deb.  Set
 UCANDROP_BUILD_DIR or UCANDROP_OUTPUT_DIR to select caller-owned directories.
-SOURCE_DATE_EPOCH defaults to the fixed 1.2.0 release epoch and may be set by
+SOURCE_DATE_EPOCH defaults to the fixed 1.2.1 release epoch and may be set by
 the release environment.
 EOF
 }
@@ -97,8 +97,8 @@ for certificate in \
         || die "certificate release input is missing or empty: $certificate"
 done
 
-if ! grep -Eq '"version"[[:space:]]*:[[:space:]]*"1\.2\.0"' "$ROOT/client/manifest.json"; then
-    die 'client/manifest.json must declare version 1.2.0 before packaging'
+if ! grep -Eq '"version"[[:space:]]*:[[:space:]]*"1\.2\.1"' "$ROOT/client/manifest.json"; then
+    die 'client/manifest.json must declare version 1.2.1 before packaging'
 fi
 
 "$ROOT/tools/build.sh" "${BUILD_ARGS[@]}"

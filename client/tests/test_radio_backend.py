@@ -140,8 +140,33 @@ class RadioBackendTests(unittest.TestCase):
         self.command("omdrop-discoverable", helper(self.CHANNEL_PROBE))
         self.env.update(install_fake_nmcli(self.bin, state))
         report = self.doctor()
-        self.assertIn("5180 MHz, channel 36", json.dumps(report["missing"]))
+        say = self.channel_say(report)
+        self.assertIn("5180 MHz, channel 36", say)
+        self.assertIn("No access point of this network in range", say)
+        self.assertIn("Set the router's 5 GHz channel to 44 or 149", say)
         self.assertNotIn("notices", report)
+
+    def channel_say(self, report):
+        rows = [m["say"] for m in report["missing"] if "channel 36" in m["say"]]
+        self.assertEqual(len(rows), 1, report)
+        return rows[0]
+
+    def test_a_locked_profile_names_the_access_point_it_could_use(self):
+        state = air(pinned={"f5c57ecd-5527-4bb5-b1a7-d697ff1ccc8d": "84:70:D7:6F:4E:A6"})
+        self.command("omdrop-discoverable", helper(self.CHANNEL_PROBE))
+        self.env.update(install_fake_nmcli(self.bin, state))
+        say = self.channel_say(self.doctor())
+        self.assertIn("access point on channel 149 in range", say)
+        self.assertIn("locked to one access point", say)
+
+    def test_a_user_without_permission_is_told_about_netdev(self):
+        state = air()
+        state["permissions"]["org.freedesktop.NetworkManager.settings.modify.system"] = "auth"
+        self.command("omdrop-discoverable", helper(self.CHANNEL_PROBE))
+        self.env.update(install_fake_nmcli(self.bin, state))
+        say = self.channel_say(self.doctor())
+        self.assertIn("access point on channel 149 in range", say)
+        self.assertIn("usermod -aG netdev", say)
 
     def test_switching_turned_off_keeps_the_channel_blocker(self):
         self.command("omdrop-discoverable", helper(self.CHANNEL_PROBE))
@@ -149,7 +174,9 @@ class RadioBackendTests(unittest.TestCase):
         self.assertEqual(self.omdrop("wifi-switch", "off").returncode, 0)
         self.assertEqual(self.omdrop("wifi-switch").stdout.strip(), "off")
         report = self.doctor()
-        self.assertIn("channel 36", json.dumps(report["missing"]))
+        say = self.channel_say(report)
+        self.assertIn("access point on channel 149 in range", say)
+        self.assertIn("ucandrop wifi-switch on", say)
         self.assertNotIn("notices", report)
 
     def test_install_with_a_probing_backend_and_nothing_missing_does_nothing(self):

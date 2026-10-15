@@ -10,7 +10,7 @@ set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 SOURCE_DIR=$ROOT/vendor/owl
 BUILD_DIR=${UCANDROP_BUILD_DIR:-$ROOT/build}
-SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1791936000}
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1792022400}
 
 die() {
     printf 'ucandrop build: %s\n' "$*" >&2
@@ -88,7 +88,7 @@ cmake_flag_path() {
 
 BUILD_FLAG_PATH=$(cmake_flag_path "$BUILD_DIR")
 ROOT_FLAG_PATH=$(cmake_flag_path "$ROOT")
-MAP_FLAGS="-ffile-prefix-map=$BUILD_FLAG_PATH=/usr/src/ucandrop-build -fmacro-prefix-map=$BUILD_FLAG_PATH=/usr/src/ucandrop-build -fdebug-prefix-map=$BUILD_FLAG_PATH=/usr/src/ucandrop-build -ffile-prefix-map=$ROOT_FLAG_PATH=/usr/src/ucandrop-1.2.0 -fmacro-prefix-map=$ROOT_FLAG_PATH=/usr/src/ucandrop-1.2.0 -fdebug-prefix-map=$ROOT_FLAG_PATH=/usr/src/ucandrop-1.2.0"
+MAP_FLAGS="-ffile-prefix-map=$BUILD_FLAG_PATH=/usr/src/ucandrop-build -fmacro-prefix-map=$BUILD_FLAG_PATH=/usr/src/ucandrop-build -fdebug-prefix-map=$BUILD_FLAG_PATH=/usr/src/ucandrop-build -ffile-prefix-map=$ROOT_FLAG_PATH=/usr/src/ucandrop-1.2.1 -fmacro-prefix-map=$ROOT_FLAG_PATH=/usr/src/ucandrop-1.2.1 -fdebug-prefix-map=$ROOT_FLAG_PATH=/usr/src/ucandrop-1.2.1"
 
 cmake \
     -S "$SOURCE_DIR" \

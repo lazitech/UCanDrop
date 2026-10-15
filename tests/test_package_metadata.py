@@ -9,7 +9,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGES = sorted((ROOT / 'dist').glob('ucandrop_1.2.0_*.deb'))
+PACKAGES = sorted((ROOT / 'dist').glob('ucandrop_1.2.1_*.deb'))
 
 
 @unittest.skipUnless(PACKAGES, 'build a native release package first')

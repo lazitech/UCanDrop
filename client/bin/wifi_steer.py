@@ -93,7 +93,10 @@ def channel(freq):
         return 14
     if 5000 <= freq < 5925:
         return (freq - 5000) // 5
-    return None
+    # 6 GHz reuses channel numbers, and "channel 37" alone would read as 5 GHz.
+    if 5925 < freq <= 7125:
+        return "%d (6 GHz)" % ((freq - 5950) // 5)
+    return "%d MHz" % freq
 
 
 def wifi_devices():
@@ -147,7 +150,11 @@ def may_pin(uuid):
 
 
 def plan(current_freq, supported):
-    """The access point to move to, or {"reason": ...} explaining why not."""
+    """The access point to move to, or {"reason": ...} explaining why not.
+
+    The candidate is chosen before the profile checks, so a "pinned" or
+    "no-permission" answer still says where a move would have gone ("to"):
+    `doctor` turns that into something the user can act on."""
     for device in wifi_devices():
         rows = scan(device)
         here = next((r for r in rows if r["in_use"]), None)
@@ -155,14 +162,6 @@ def plan(current_freq, supported):
             continue
         if not here["ssid"]:
             return {"reason": "hidden"}
-        uuid = first_line(nmcli("-g", "GENERAL.CON-UUID", "device", "show", device))
-        if not uuid:
-            return {"reason": "no-profile"}
-        pinned = first_line(nmcli("-g", "802-11-wireless.bssid", "connection", "show", "uuid", uuid))
-        if pinned:
-            return {"reason": "pinned"}
-        if not may_pin(uuid):
-            return {"reason": "no-permission"}
         best, best_score = None, None
         for r in rows:
             if r["in_use"] or r["ssid"] != here["ssid"] or r["freq"] not in supported:
@@ -174,11 +173,19 @@ def plan(current_freq, supported):
                 best, best_score = r, score
         if not best:
             return {"reason": "no-access-point"}
+        to = {"bssid": best["bssid"], "freq": best["freq"],
+              "channel": channel(best["freq"]), "signal": best["signal"]}
+        uuid = first_line(nmcli("-g", "GENERAL.CON-UUID", "device", "show", device))
+        if not uuid:
+            return {"reason": "no-profile"}
+        if first_line(nmcli("-g", "802-11-wireless.bssid", "connection", "show", "uuid", uuid)):
+            return {"reason": "pinned", "to": to}
+        if not may_pin(uuid):
+            return {"reason": "no-permission", "to": to}
         return {"device": device, "uuid": uuid, "ssid": here["ssid"],
                 "from": {"bssid": here["bssid"], "freq": here["freq"],
                          "channel": channel(here["freq"])},
-                "to": {"bssid": best["bssid"], "freq": best["freq"],
-                       "channel": channel(best["freq"]), "signal": best["signal"]}}
+                "to": to}
     return {"reason": "no-device"}
 
 

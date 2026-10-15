@@ -10,10 +10,10 @@
 目标系统是 **Ubuntu 26.04 桌面版**，GNOME 为参考桌面。需要蓝牙和兼容的无线网卡；
 无线要求见下方「兼容范围」。
 
-下载[发布附件](https://github.com/lazitech/ucandrop/releases/tag/v1.2.0)中的 **`ucandrop_1.2.0_amd64.deb`**，在该文件所在目录打开终端，运行：
+下载[发布附件](https://github.com/lazitech/ucandrop/releases/tag/v1.2.1)中的 **`ucandrop_1.2.1_amd64.deb`**，在该文件所在目录打开终端，运行：
 
 ```bash
-sudo apt install ./ucandrop_1.2.0_amd64.deb
+sudo apt install ./ucandrop_1.2.1_amd64.deb
 ucandrop setup
 ```
 
@@ -108,7 +108,7 @@ ucandrop doctor --json
 
 ## 从源码安装（可选）
 
-需要自行构建、修改代码或使用 arm64 时，下载并解压[源码压缩包](https://github.com/lazitech/ucandrop/releases/download/v1.2.0/ucandrop-1.2.0-source.tar.gz)，
+需要自行构建、修改代码或使用 arm64 时，下载并解压[源码压缩包](https://github.com/lazitech/ucandrop/releases/download/v1.2.1/ucandrop-1.2.1-source.tar.gz)，
 在项目目录中以普通桌面用户运行：
 
 ```bash
